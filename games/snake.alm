@@ -1,0 +1,179 @@
+--
+-- snake -- a classic snake game for the aldan 4
+-- usage:
+--      snake.play
+-- authors:
+--      ortfero <ortfero@gmail.com>, 2026
+-- license: cc-by-sa 4.0
+--
+
+fn play() raises
+
+implementation
+
+const board_x     = 17
+const board_y     = 5
+const board_w     = 100
+const board_h     = 35
+const max_len     = 1000
+const tick_ms     = 120
+const score_width = 20
+
+var snake_x  [max_len]u8
+var snake_y  [max_len]u8
+var frame    [screen.size]u8
+var head     s64
+var tail     s64
+var dir_x    s64
+var dir_y    s64
+var food_x   s64
+var food_y   s64
+var rng      random.state
+var score    s64
+var running  bool
+
+
+fn put_ch (col s64, row s64, ch u8):
+    frame[row * screen.width + col] = ch;;
+
+
+fn put_str (col s64, row s64, s string)
+        off s64,
+        dst []u8:
+    off = row * screen.width + col;
+    dst = frame[off:off + (length s)];
+    bytes.copy s, dst&;;
+
+
+fn present ():
+    screen.blit frame, screen.normal;;
+
+
+fn place_food () raises
+        i s64, collision bool:
+    for:
+        food_x = random.range rng&, board_x, (board_x + board_w);
+        food_y = random.range rng&, board_y, (board_y + board_h);
+        collision = false;
+        i = tail;
+        for:
+            if and ((snake_x[i] as s64) == food_x), ((snake_y[i] as s64) == food_y) then:
+                collision = true;
+                break;;
+            if i == head then: break;;
+            i = i + 1;
+            if i >= max_len then: i = 0;;;
+        if not collision then: break;;;
+    put_ch food_x, food_y, '*';;
+
+
+fn paint_title ():
+    put_str board_x, (board_y - 3),
+        "snake -- arrows: move, ctrl+q: quit";;
+
+
+fn paint_score () raises
+        buffer [64]u8,
+        s      string,
+        off    s64,
+        row    []u8:
+    s = format buffer&, "score: ", score;
+    off = (board_y + board_h + 1) * screen.width + board_x;
+    row = frame[off:off + score_width];
+    bytes.fill row&, ' ';
+    put_str board_x, (board_y + board_h + 1), s;;
+
+
+fn paint_border ()
+        i s64:
+    i = 0; for i < board_w; i += 1:
+        put_ch (board_x + i), (board_y - 1), '-';
+        put_ch (board_x + i), (board_y + board_h), '-';;
+    i = 0; for i < board_h; i += 1:
+        put_ch (board_x - 1), (board_y + i), '|';
+        put_ch (board_x + board_w), (board_y + i), '|';;
+    put_ch (board_x - 1), (board_y - 1), '+';
+    put_ch (board_x + board_w), (board_y - 1), '+';
+    put_ch (board_x - 1), (board_y + board_h), '+';
+    put_ch (board_x + board_w), (board_y + board_h), '+';;
+
+
+fn try_turn (nx s64, ny s64):
+    -- reject reversing onto the immediately-trailing cell.
+    if and (nx == -dir_x), (ny == -dir_y) then
+        return none;
+    dir_x = nx;
+    dir_y = ny;;
+
+
+fn handle_input ()
+        k screen.key:
+    for:
+        if not (screen.poll_key k&) then: return none;;
+        if not (k.is_key_down) then: continue;;
+        -- ctrl+q exits.
+        if and (k.code == 'q'), k.is_ctrl_pressed then:
+            running = false;
+            return none;;
+        if k.is_control_key then:
+            if k.code == screen.key_arrow_up    then: try_turn 0, -1;;
+            if k.code == screen.key_arrow_down  then: try_turn 0, 1;;
+            if k.code == screen.key_arrow_left  then: try_turn -1, 0;;
+            if k.code == screen.key_arrow_right then: try_turn 1, 0;;;;;
+
+
+fn advance () raises
+        nx       s64,
+        ny       s64,
+        new_head s64,
+        new_tail s64:
+    nx = (snake_x[head] as s64) + dir_x;
+    ny = (snake_y[head] as s64) + dir_y;
+    if or (nx < board_x), (nx >= board_x + board_w), (ny < board_y), (ny >= board_y + board_h) then:
+        running = false;
+        return none;;
+    new_head = head + 1;
+    if new_head >= max_len then: new_head = 0;;
+    -- demote previous head to a body cell.
+    put_ch (snake_x[head] as s64), (snake_y[head] as s64), 'o';
+    snake_x[new_head] = nx as u8;
+    snake_y[new_head] = ny as u8;
+    head = new_head;
+    if and (nx == food_x), (ny == food_y) then:
+        score += 1;
+        place_food;
+        paint_score;
+    ; else:
+        put_ch (snake_x[tail] as s64), (snake_y[tail] as s64), ' ';
+        new_tail = tail + 1;
+        if new_tail >= max_len then: new_tail = 0;;
+        tail = new_tail;;
+    put_ch nx, ny, '@';
+    present;;
+
+
+fn play () raises
+        last s64:
+    screen.snapshot;
+    defer screen.restore;
+    paint_title;
+    paint_border;
+    head = 0;
+    tail = 0;
+    snake_x[0] = (board_x + board_w / 2) as u8;
+    snake_y[0] = (board_y + board_h / 2) as u8;
+    dir_x = 1;
+    dir_y = 0;
+    score = 0;
+    running = true;
+    random.seed rng&, clock.now;
+    place_food;
+    put_ch (snake_x[0] as s64), (snake_y[0] as s64), '@';
+    paint_score;
+    present;
+    last = clock.now;
+    for running:
+        handle_input;
+        if (clock.elapsed_ms last) >= tick_ms then:
+            last = clock.now;
+            advance;;;;

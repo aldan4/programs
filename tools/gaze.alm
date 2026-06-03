@@ -1,0 +1,171 @@
+--
+-- gaze —- text pager
+-- usage:
+--      gaze.at 'path
+-- authors
+--      ortfero <ortfero@gmail.com>, 2026
+-- license: cc-by-sa 4.0
+--
+
+import "bytes", "file", "screen"
+
+fn at (path string) raises
+
+implementation
+
+const chunk_cap  = 16384
+const text_width = 60
+const newline    = 10
+const cr         = 13
+
+var h          file.id
+var file_size  s64
+var top_offset s64
+var chunk      [chunk_cap]u8
+var chunk_view []u8
+var frame      [screen.size]u8
+
+fn put_ch (col s64, row s64, ch u8):
+  frame[row * screen.width + col] = ch;;
+
+fn present ():
+  screen.blit frame, screen.normal;;
+
+fn redraw () raises
+      left     s64,
+      rows     s64,
+      row      s64,
+      col      s64,
+      i        s64,
+      j        s64,
+      word_len s64,
+      ch       u8:
+  bytes.clear frame&;
+  left = (screen.width - text_width) / 2;
+  if left < 0 then: left = 0;;
+  rows = screen.height;
+  file.seek h, top_offset;
+  chunk_view = file.read h, chunk&;
+  row = 0;
+  col = 0;
+  i = 0;
+  for i < length chunk_view:
+    if row >= rows then: present; return none;;
+    ch = chunk_view[i];
+    if ch == cr then: i = i + 1; continue;;
+    if ch == newline then:
+      row = row + 1;
+      col = 0;
+      i = i + 1;
+      continue;;
+    if ch == ' ' then:
+      if col == 0 then:
+        put_ch (left + col), row, ' ';
+        col = col + 1;
+        i = i + 1;
+        continue;;
+      j = i + 1;
+      word_len = 0;
+      for j < length chunk_view:
+        ch = chunk_view[j];
+        if or (ch == ' '), (ch == newline), (ch == cr) then: break;;
+        word_len = word_len + 1;
+        j = j + 1;;
+      if (col + 1 + word_len) > text_width then:
+        row = row + 1;
+        col = 0;
+      ; else:
+        put_ch (left + col), row, ' ';
+        col = col + 1;;
+      i = i + 1;
+      continue;;
+    if col >= text_width then:
+      row = row + 1;
+      col = 0;;
+    if row >= rows then: present; return none;;
+    put_ch (left + col), row, ch;
+    col = col + 1;
+    i = i + 1;;
+  present;
+  return none;;
+
+fn next_line_offset s64 (start s64, lines s64) raises
+      cur   s64,
+      view  []u8,
+      i     s64,
+      count s64:
+  cur = start;
+  count = 0;
+  for cur < file_size:
+    file.seek h, cur;
+    view = file.read h, chunk&;
+    if length view == 0 then: return cur;;
+    i = 0;
+    for i < length view:
+      if view[i] == newline then:
+        count = count + 1;
+        if count == lines then: return cur + i + 1;;;
+      i = i + 1;;
+    cur = cur + length view;;
+  return cur;;
+
+fn prev_line_offset s64 (start s64, lines s64) raises
+      base  s64,
+      span  s64,
+      view  []u8,
+      i     s64,
+      count s64:
+  if start <= 0 then: return 0;;
+  base = start - chunk_cap;
+  if base < 0 then: base = 0;;
+  span = start - base;
+  file.seek h, base;
+  view = file.read h, chunk&;
+  if length view < span then: span = length view;;
+  -- byte at view[span-1] is the '\n' that ended the line bringing us to start; skip it.
+  i = span - 2;
+  count = 0;
+  for i >= 0:
+    if view[i] == newline then:
+      count = count + 1;
+      if count == lines then: return base + i + 1;;;
+    i = i - 1;;
+  return base;;
+
+fn at (path string) raises
+      k       screen.key,
+      half    s64,
+      step    s64,
+      new_top s64:
+  h = file.open path;
+  defer file.close h;
+  file_size = file.size path;
+  screen.snapshot;
+  defer screen.restore;
+  top_offset = 0;
+  redraw;
+  for:
+    if not (screen.poll_key k&) then: continue;;
+    if not (k.is_key_down) then: continue;;
+    -- Ctrl+Q exits.
+    if and (k.code == 'q'), k.is_ctrl_pressed then: return none;;
+    if not (k.is_control_key) then: continue;;
+    half = screen.height / 2;
+    if half == 0 then: half = 1;;
+    step = 0;
+    if k.code == screen.key_arrow_down then: step = 1;;
+    if k.code == screen.key_page_down then: step = half;;
+    if step > 0 then:
+      new_top = next_line_offset top_offset, step;
+      if new_top != top_offset then:
+        top_offset = new_top;
+        redraw;;;
+    step = 0;
+    if k.code == screen.key_arrow_up then: step = 1;;
+    if k.code == screen.key_page_up then: step = half;;
+    if step > 0 then:
+      new_top = prev_line_offset top_offset, step;
+      if new_top != top_offset then:
+        top_offset = new_top;
+        redraw;;;;
+  return none;;

@@ -1,0 +1,76 @@
+--
+-- sieve -- cpu benchmark
+-- usage:
+--      sieve.run
+-- authors:
+--      ortfero <ortfero@gmail.com>, 2026
+-- license: cc-by-sa 4.0
+--
+
+import "clock", "task"
+
+fault wrong_prime_count
+
+-- sieve `numbers` in place and return the count of primes found
+fn find s64 (numbers& []bool)
+
+-- benchmark `find` and return the maximum iterations-per-second
+fn run s64 () raises
+
+implementation
+
+const size         = 8190
+const primes_count = 1899
+const nof_samples  = 20
+const window_ms    = 50
+
+-- only odd numbers are tracked: flags[i] stands for
+-- the odd number 2*i + 3.
+var flags [size]bool
+
+
+-- sieve `numbers` in place and return the count of primes found
+fn find s64 (numbers& []bool)
+    i s64, count s64, k s64, prime s64, n s64:
+    
+  -- reset the sieve
+  boolean.fill numbers&, true;
+  count = 0; n = length numbers;
+
+  i = 0; for i != n; i += 1:
+    if not numbers[i] then
+      continue;
+    -- numbers[i] is prime p = 2*i + 3; cross out its odd multiples.
+    -- the index stride is `prime` because each step advances 2*prime
+    -- in value space, skipping the even multiples we never tracked.
+    prime = i + i + 3;
+    k = i + prime; for k < n; k += prime:
+      numbers[k] = false;;
+    count += 1;;
+  count;;
+
+
+-- benchmark `find` and return the maximum iterations-per-second
+fn run s64 () raises
+    s s64, n s64, c s64, ips s64, best_ips s64,
+    started clock.tick, actual_ms s64:
+    
+  c = find flags&;
+  -- sanity check: `find` must agree with the known prime count
+  if c != primes_count then
+      raise wrong_prime_count;
+      
+  best_ips = 0;
+  s = 0; for s != nof_samples; s += 1:
+      started = clock.now;
+      -- count iterations
+      n = 0; for (clock.elapsed_ms started) < window_ms; n += 1:
+          c = find flags&;;
+
+      actual_ms = clock.elapsed_ms started;
+      ips = (n * 1000) / actual_ms;
+      if ips > best_ips then
+          best_ips = ips;
+      task.yield;;
+      
+  best_ips;;

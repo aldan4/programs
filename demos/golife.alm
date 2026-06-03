@@ -1,0 +1,146 @@
+--
+-- golife -- conway's game of life
+-- usage:
+--      golife.play
+-- authors:
+--      ortfero <ortfero@gmail.com>, 2026
+-- license: cc-by-sa 4.0
+--
+
+fn play() raises
+
+implementation
+
+const board_x      = 3
+const board_y      = 3
+const board_w      = 128 -- should be power of 2
+const board_h      = 40
+const grid_size    = 5120 -- board_w * board_h
+const tick_ms      = 100
+const live_density = 30 -- for reset
+
+
+-- state
+
+var cells        [grid_size]bool
+var next_cells   [grid_size]bool
+var entropy      random.state
+var paused       bool
+var generation   s64
+var population   s64
+
+
+-- count live neighbours of cell `i` (its column is `x`)
+fn count_neighbors s64 (x s64, i s64)
+    n s64, left bool, right bool, up bool, down bool:
+  n = 0;
+  left = x != 0; right = x != board_w - 1;
+  up = i >= board_w; down = i < grid_size - board_w;
+  if and up, left, cells[i - board_w - 1] then n += 1;
+  if and up, cells[i - board_w] then n += 1;
+  if and up, right, cells[i - board_w + 1] then n += 1;
+  if and left, cells[i - 1] then n += 1;
+  if and right, cells[i + 1] then n += 1;
+  if and down, left, cells[i + board_w - 1] then n += 1;
+  if and down, cells[i + board_w] then n += 1;
+  if and down, right, cells[i + board_w + 1] then n += 1;
+  n;;
+
+
+-- advance one generation: update cells, population, generation
+fn step ()
+    n s64, born bool, i s64, p s64, x s64:
+  p = 0; x = 0;
+  i = 0; for i != grid_size; i += 1:
+    n = count_neighbors x, i;
+    born = if cells[i]
+      then or (n == 2), (n == 3)
+      else n == 3;
+    next_cells[i] = born;
+    if born then p += 1;
+    x = and (x + 1), (board_w - 1);;
+  boolean.copy next_cells, cells&;
+  population = p; generation += 1;;
+
+-- reseed cells with live_density% alive; zero generation, recount population
+fn reset () raises
+    i s64, p s64:
+  p = 0;
+  i = 0; for i != grid_size; i += 1:
+    cells[i] = (random.range entropy&, 0, 100) < live_density;
+    if cells[i] then
+      p += 1;;
+  population = p;
+  generation = 0;;
+
+-- draw
+    
+var frame screen.surface
+
+-- redraw all cells and the status line into the frame and blit
+fn refresh () raises
+    x s64, y s64, i s64, j s64, buffer [128]u8:
+  y = 0; for y != board_h; y += 1:
+    x = 0; for x != board_w; x += 1:
+      i = (board_y + y) * screen.width + (board_x + x);
+      j = y * board_w + x;
+      frame[i] = if cells[j] then '#' else ' ';
+    ;;
+  screen.bottom frame&,
+    (format buffer&, "gen: ", generation, "  pop: ", population, "  ",
+      (if paused then "[paused]" else "        "));
+  screen.blit frame, screen.normal;;
+
+
+-- clear the frame, draw the title and the border, then refresh
+fn paint () raises:
+  screen.clear frame&;
+  screen.top frame&,
+    "space: pause, r: reset, ctrl+q: quit";
+  screen.frame frame&, (board_x - 1), (board_y - 1),
+    (board_w + 2), (board_h + 2);
+  refresh;;
+
+
+-- input
+
+var quit bool
+
+-- drain pending key events; toggle pause, trigger reset, or quit
+fn handle_input () raises
+    k screen.key:
+  for:
+    if not (screen.poll_key k&) then
+      return none;
+    if not (k.is_key_down) then
+      continue;
+    if k.is_control_key then
+      return none;    
+    if and (k.code == 'q'), k.is_ctrl_pressed then:
+      quit = true; return none;;
+    if k.code == ' ' then:
+      paused = not paused; refresh;;
+    if k.code == 'r' then:
+      reset; paint;
+    ;;;
+
+
+-- entry point: snapshot the screen, seed, paint, run until quit
+fn play () raises
+    last clock.tick:
+  screen.snapshot;
+  defer screen.restore;
+  
+  random.seed entropy&, clock.now;
+  reset; paint;
+  
+  paused = false;
+  last = clock.now;
+
+  quit = false; for not quit:
+    handle_input;
+    if or paused, (clock.elapsed_ms last < tick_ms) then
+      continue;  
+    last = clock.now;
+    step; refresh;
+  ;;
