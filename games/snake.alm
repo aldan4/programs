@@ -108,9 +108,7 @@ fn draw () raises
 -- drain pending key events; turn the snake or quit
 fn handle_input ()
     k screen.key:
-  for:
-    if not (screen.poll_key k&) then
-      return none;
+  for screen.poll_key k&:
     if not (k.is_key_down) then
       continue;
     if k.is_control_key then:

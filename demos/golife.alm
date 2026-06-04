@@ -11,13 +11,11 @@ fn play() raises
 
 implementation
 
-const board_x      = 3
-const board_y      = 3
-const board_w      = 128 -- should be power of 2
-const board_h      = 40
-const grid_size    = 5120 -- board_w * board_h
-const tick_ms      = 100
-const live_density = 30 -- for reset
+const board_x       = 3   const board_y   = 3
+const board_h       = 40  const board_w   = 128 -- should be power of 2
+const grid_size     = 5120 -- board_w * board_h
+const tick_ms       = 100
+const live_density  = 30 -- for reset
 
 
 -- state
@@ -77,29 +75,26 @@ fn reset () raises
     
 var frame screen.surface
 
--- redraw all cells and the status line into the frame and blit
-fn refresh () raises
+-- redraw the frame: border, live cells, then blit 
+fn draw () raises
     x s64, y s64, i s64, j s64, buffer [128]u8:
-  y = 0; for y != board_h; y += 1:
-    x = 0; for x != board_w; x += 1:
-      i = (board_y + y) * screen.width + (board_x + x);
-      j = y * board_w + x;
-      frame[i] = if cells[j] then '#' else ' ';
-    ;;
-  screen.top frame&,
-    (format buffer&, "gen: ", generation, "  pop: ", population, "  ",
-      (if paused then "[paused]" else "        "));
-  screen.blit frame, screen.normal;;
-
-
--- clear the frame, draw the title and the border, then refresh
-fn paint () raises:
   screen.clear frame&;
   screen.bottom frame&,
     "space: pause, r: reset, ctrl+q: quit";
   screen.frame frame&, (board_x - 1), (board_y - 1),
     (board_w + 2), (board_h + 2);
-  refresh;;
+  y = 0; for y != board_h; y += 1:
+    x = 0; for x != board_w; x += 1:
+      j = y * board_w + x;
+      if not cells[j] then
+        continue;
+      i = (board_y + y) * screen.width + (board_x + x);
+      frame[i] = '#';
+    ;;
+  screen.top frame&,
+    (format buffer&, "gen: ", generation, "  pop: ", population, "  ",
+      (if paused then "[paused]" else ""));
+  screen.blit frame, screen.normal;;
 
 
 -- input
@@ -109,9 +104,7 @@ var quit bool
 -- drain pending key events; toggle pause, trigger reset, or quit
 fn handle_input () raises
     k screen.key:
-  for:
-    if not (screen.poll_key k&) then
-      return none;
+  for screen.poll_key k&:
     if not (k.is_key_down) then
       continue;
     if k.is_control_key then
@@ -119,9 +112,9 @@ fn handle_input () raises
     if and (k.code == 'q'), k.is_ctrl_pressed then:
       quit = true; return none;;
     if k.code == ' ' then:
-      paused = not paused; refresh;;
+      paused = not paused; draw;;
     if k.code == 'r' then:
-      reset; paint;
+      reset; draw;
     ;;;
 
 
@@ -132,8 +125,8 @@ fn play () raises
   defer screen.restore;
   
   random.seed entropy&, clock.now;
-  reset; paint;
-  
+  reset; draw;
+
   paused = false;
   last = clock.now;
 
@@ -142,5 +135,5 @@ fn play () raises
     if or paused, (clock.elapsed_ms last < tick_ms) then
       continue;  
     last = clock.now;
-    step; refresh;
+    step; draw;
   ;;
