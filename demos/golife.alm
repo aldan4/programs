@@ -86,7 +86,7 @@ fn refresh () raises
       j = y * board_w + x;
       frame[i] = if cells[j] then '#' else ' ';
     ;;
-  screen.bottom frame&,
+  screen.top frame&,
     (format buffer&, "gen: ", generation, "  pop: ", population, "  ",
       (if paused then "[paused]" else "        "));
   screen.blit frame, screen.normal;;
@@ -95,7 +95,7 @@ fn refresh () raises
 -- clear the frame, draw the title and the border, then refresh
 fn paint () raises:
   screen.clear frame&;
-  screen.top frame&,
+  screen.bottom frame&,
     "space: pause, r: reset, ctrl+q: quit";
   screen.frame frame&, (board_x - 1), (board_y - 1),
     (board_w + 2), (board_h + 2);

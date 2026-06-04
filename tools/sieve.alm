@@ -7,8 +7,6 @@
 -- license: cc-by-sa 4.0
 --
 
-import "clock", "task"
-
 fault wrong_prime_count
 
 -- sieve `numbers` in place and return the count of primes found
