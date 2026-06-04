@@ -11,29 +11,21 @@ fn play() raises
 
 implementation
 
-const board_x  = 17
-const board_y  = 5
-const board_w  = 100
-const board_h  = 35
-const max_len   = 1024
-const ring_mask = 1023  -- max_len - 1, masks the ring index instead of branching
-const tick_ms   = 120
+const board_x = 17    const board_y = 5
+const board_w = 100   const board_h = 35
+const max_len = 1024  const ring_mask = 1023  -- masks the ring index
+const tick_ms = 120
 
 
 -- game state
 
-var snake_x  [max_len]u8
-var snake_y  [max_len]u8
-var head     s64
-var tail     s64
-var dir_x    s64
-var dir_y    s64
-var food_x   s64
-var food_y   s64
-var entropy  random.state
+var snake_x [max_len]u8   var snake_y [max_len]u8
+var head    s64           var tail    s64
+var dir_x   s64           var dir_y   s64
+var food_x  s64           var food_y  s64
+var entropy random.state
 var score    s64
 var quit     bool
-var frame    screen.surface
 
 
 -- pick a random empty cell for the next food
@@ -58,8 +50,7 @@ fn reset () raises:
   head = 0; tail = 0;
   snake_x[0] = (board_x + board_w / 2) as u8;
   snake_y[0] = (board_y + board_h / 2) as u8;
-  dir_x = 1;
-  dir_y = 0;
+  dir_x = 1; dir_y = 0;
   score = 0;
   place_food;;
 
@@ -68,8 +59,7 @@ fn reset () raises:
 fn try_turn (nx s64, ny s64):
   if and (nx == -dir_x), (ny == -dir_y) then
     return none;
-  dir_x = nx;
-  dir_y = ny;;
+  dir_x = nx; dir_y = ny;;
 
 
 -- advance one tick: move the head, handle walls, growth, and eating
@@ -92,6 +82,7 @@ fn step () raises
     tail = and (tail + 1), ring_mask;
   ;;
 
+var frame screen.surface
 
 -- redraw the whole frame from scratch: clear, border, title, snake, food,
 -- score, then blit
