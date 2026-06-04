@@ -39,12 +39,12 @@ var frame    screen.surface
 -- pick a random empty cell for the next food
 fn place_food () raises
     i s64, stop s64, collision bool:
-  stop = and (head + 1), (ring_mask as s64);
+  stop = and (head + 1), ring_mask;
   collision = true; for collision:
     food_x = random.range entropy&, board_x, (board_x + board_w);
     food_y = random.range entropy&, board_y, (board_y + board_h);
     collision = false;
-    i = tail; for i != stop; i = and (i + 1), (ring_mask as s64):
+    i = tail; for i != stop; i = and (i + 1), ring_mask:
       if or ((snake_x[i] as s64) != food_x),
             ((snake_y[i] as s64) != food_y) then
         continue;
@@ -81,7 +81,7 @@ fn step () raises
         (ny < board_y), (ny >= board_y + board_h) then:
     quit = true;
     return none;;
-  new_head = and (head + 1), (ring_mask as s64);
+  new_head = and (head + 1), ring_mask;
   snake_x[new_head] = nx as u8;
   snake_y[new_head] = ny as u8;
   head = new_head;
@@ -89,7 +89,7 @@ fn step () raises
     score += 1;
     place_food;;
   else:
-    tail = and (tail + 1), (ring_mask as s64);
+    tail = and (tail + 1), ring_mask;
   ;;
 
 
@@ -102,8 +102,8 @@ fn draw () raises
     "snake -- arrows: move, ctrl+q: quit";
   screen.frame frame&, (board_x - 1), (board_y - 1),
     (board_w + 2), (board_h + 2);
-  stop = and (head + 1), (ring_mask as s64);
-  i = tail; for i != stop; i = and (i + 1), (ring_mask as s64):
+  stop = and (head + 1), ring_mask;
+  i = tail; for i != stop; i = and (i + 1), ring_mask:
     off = (snake_y[i] as s64) * screen.width + (snake_x[i] as s64);
     frame[off] = if i == head then '@' else 'o';;
   frame[food_y * screen.width + food_x] = '*';
