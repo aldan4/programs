@@ -7,142 +7,175 @@
 -- license: cc-by-sa 4.0
 --
 
-fn play() raises
+import 'core/clock, 'core/random, 'core/screen,
+  'core/task, 'core/heap, 'core/text
 
-implementation
+fn play()
+    raises logic_fault, data_fault, resource_fault
 
-const board_x = 17    const board_y = 5
-const board_w = 100   const board_h = 35
-const max_len = 1024  const ring_mask = 1023  -- masks the ring index
-const tick_ms = 120
+body
+
+const board_x   = 37
+const board_y   = 10
+const board_w   = 60
+const board_h   = 24
+const max_len   = 1024
+const ring_mask = 1023  -- masks the ring index
+const tick_ms   = 100
 
 
 -- game state
 
-var snake_x [max_len]u8   var snake_y [max_len]u8
-var head    s64           var tail    s64
-var dir_x   s64           var dir_y   s64
-var food_x  s64           var food_y  s64
+type coord_buffer [max_len]u8
+type frame_buffer [screen.size]u8
+
+-- snake_x/snake_y/frame hold the heap buffers; they are claimed as non-null
+-- locals in `play` and threaded as parameters, so the workers need no guard.
+var head    s64               var tail    s64
+var dir_x   s64               var dir_y   s64
+var food_x  s64               var food_y  s64
 var entropy random.state
-var score    s64
-var quit     bool
+var score   s64
+var quit    bool
 
 
 -- pick a random empty cell for the next food
-fn place_food () raises
-    i s64, stop s64, collision bool:
+fn place_food (sx ^coord_buffer, sy ^coord_buffer)
+    raises logic_fault
+    i s64, stop s64, collision bool {
   stop = and (head + 1), ring_mask;
-  collision = true; for collision:
+  collision = true; for collision {
     food_x = random.range entropy&, board_x, (board_x + board_w);
     food_y = random.range entropy&, board_y, (board_y + board_h);
     collision = false;
-    i = tail; for i != stop; i = and (i + 1), ring_mask:
-      if or ((snake_x[i] as s64) != food_x),
-            ((snake_y[i] as s64) != food_y) then
+    i = tail; for i != stop; i = and (i + 1), ring_mask {
+      if or ((sx^[i] as s64) != food_x),
+            ((sy^[i] as s64) != food_y) {
         continue;
+      }
       collision = true;
       break;
-    ;;;
+    }
+  }
+}
 
 
 -- (re)initialise the snake at the centre and drop the first food
-fn reset () raises:
+fn reset (sx ^coord_buffer, sy ^coord_buffer)
+    raises logic_fault {
   head = 0; tail = 0;
-  snake_x[0] = (board_x + board_w / 2) as u8;
-  snake_y[0] = (board_y + board_h / 2) as u8;
+  sx^[0] = (board_x + board_w / 2) as u8;
+  sy^[0] = (board_y + board_h / 2) as u8;
   dir_x = 1; dir_y = 0;
   score = 0;
-  place_food;;
+  place_food sx, sy;
+}
 
 
 -- change direction, rejecting a 180-degree reversal onto the neck
-fn try_turn (nx s64, ny s64):
-  if and (nx == -dir_x), (ny == -dir_y) then
+fn try_turn (nx s64, ny s64) {
+  if and (nx == -dir_x), (ny == -dir_y) {
     return none;
-  dir_x = nx; dir_y = ny;;
+  }
+  dir_x = nx; dir_y = ny;
+}
 
 
 -- advance one tick: move the head, handle walls, growth, and eating
-fn step () raises
-    nx s64, ny s64, new_head s64:
-  nx = (snake_x[head] as s64) + dir_x;
-  ny = (snake_y[head] as s64) + dir_y;
+fn step (sx ^coord_buffer, sy ^coord_buffer)
+    raises logic_fault
+    nx s64, ny s64, new_head s64 {
+  nx = (sx^[head] as s64) + dir_x;
+  ny = (sy^[head] as s64) + dir_y;
   if or (nx < board_x), (nx >= board_x + board_w),
-        (ny < board_y), (ny >= board_y + board_h) then:
+        (ny < board_y), (ny >= board_y + board_h) {
     quit = true;
-    return none;;
+    return none;
+  }
   new_head = and (head + 1), ring_mask;
-  snake_x[new_head] = nx as u8;
-  snake_y[new_head] = ny as u8;
+  sx^[new_head] = nx as u8;
+  sy^[new_head] = ny as u8;
   head = new_head;
-  if and (nx == food_x), (ny == food_y) then:
+  if and (nx == food_x), (ny == food_y) {
     score += 1;
-    place_food;;
-  else:
+    place_food sx, sy;
+  } else {
     tail = and (tail + 1), ring_mask;
-  ;;
+  }
+}
 
-var frame screen.surface
-
--- redraw the whole frame from scratch: clear, border, title, snake, food,
--- score, then blit
-fn draw () raises
-    i s64, off s64, stop s64, buffer [64]u8:
-  screen.clear frame&;
-  screen.bottom frame&,
-    "snake -- arrows: move, ctrl+q: quit";
-  screen.frame frame&, (board_x - 1), (board_y - 1),
+-- redraw the whole: clear, border, title, snake, food, score
+fn draw (fr ^frame_buffer, sx ^coord_buffer, sy ^coord_buffer)
+    raises data_fault, logic_fault
+    i s64, off s64, stop s64, buffer [64]u8 {
+  screen.clear fr^&;
+  screen.bottom fr^&, " ctrl+q: quit";
+  screen.frame fr^&, (board_x - 1), (board_y - 1),
     (board_w + 2), (board_h + 2);
   stop = and (head + 1), ring_mask;
-  i = tail; for i != stop; i = and (i + 1), ring_mask:
-    off = (snake_y[i] as s64) * screen.width + (snake_x[i] as s64);
-    frame[off] = if i == head then '@' else 'o';;
-  frame[food_y * screen.width + food_x] = '*';
-  screen.top frame&,
-    (format buffer&, "score: ", score);
-  screen.blit frame, screen.normal;;
+  i = tail; for i != stop; i = and (i + 1), ring_mask {
+    off = (sy^[i] as s64) * screen.width + (sx^[i] as s64);
+    fr^[off] = if i == head { '@'; } else { 'o'; };
+  }
+  fr^[food_y * screen.width + food_x] = '*';
+  screen.print fr^&, (board_x - 1), (board_y - 2),
+    (text.format buffer&, "score: ", score);
+  screen.blit fr^, screen.normal;
+}
 
 
 -- input
 
 -- drain pending key events; turn the snake or quit
 fn handle_input ()
-    k screen.key:
-  for screen.poll_key k&:
-    if not (k.is_key_down) then
-      continue;
-    if k.is_control_key then:
-      if k.code == screen.key_arrow_up then
-        try_turn 0, -1;
-      if k.code == screen.key_arrow_down then
-        try_turn 0, 1;
-      if k.code == screen.key_arrow_left then
-        try_turn -1, 0;
-      if k.code == screen.key_arrow_right then
-        try_turn 1, 0;
-      return none;;
-    if and (k.code == 'q'), k.is_ctrl_pressed then:
-      quit = true;
+    k screen.key {
+  for screen.poll_key k& {
+    if not (k.is_key_down) { continue; }
+    if k.is_control_key {
+      when k.code {
+      | screen.key_arrow_up: try_turn 0, -1;
+      | screen.key_arrow_down: try_turn 0, 1;
+      | screen.key_arrow_left: try_turn -1, 0;
+      | screen.key_arrow_right: try_turn 1, 0;
+      }
       return none;
-    ;;;
+    }
+    if and (k.code == 'q'), k.is_ctrl_pressed {
+      return quit = true;
+    }
+  }
+}
 
 
 -- entry point: snapshot the screen, seed, draw, run until quit
-fn play () raises
-    last s64:
+fn play ()
+    raises logic_fault, data_fault, resource_fault
+    last s64, snake_x ^coord_buffer, snake_y ^coord_buffer,
+    frame ^frame_buffer {
+  snake_x = heap.claim coord_buffer;
+  defer heap.release snake_x;
+  snake_y = heap.claim coord_buffer;
+  defer heap.release snake_y;
+  frame = heap.claim frame_buffer;
+  defer heap.release frame;
   screen.snapshot;
   defer screen.restore;
 
   random.seed entropy&, clock.now;
-  reset; draw;
+  reset snake_x, snake_y;
+  draw frame, snake_x, snake_y;
 
   quit = false;
   last = clock.now;
 
-  for not quit:
+  for not quit {
     handle_input;
-    if (clock.elapsed_ms last) < tick_ms then
-      continue;  
+    if (clock.elapsed_ms last) < tick_ms {
+      task.yield;
+      continue;
+    }
     last = clock.now;
-    step; draw;
-  ;;
+    step snake_x, snake_y;
+    draw frame, snake_x, snake_y;
+  }
+}

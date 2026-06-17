@@ -7,29 +7,38 @@
 -- license: cc-by-sa 4.0
 --
 
-import "bytes", "file", "screen"
+import 'core/bytes, 'core/screen, 'core/tty, 'core/file, 'core/heap
 
-fn in (path string) raises
+fn in (path string) raises data_fault, storage_fault, resource_fault
 
-implementation
+body
 
 const max_capacity = 65536
 const tab          = 9
 const newline      = 10
 const cr           = 13
 
+-- the edit buffer is held as a pointer (8 bytes in bss); the 64KB is
+-- allocated on the heap only while a file is open (see `in`), then freed.
+type buffer_type [max_capacity]u8
+type frame_buffer [screen.size]u8
+
 var h           file.id
-var buffer      [max_capacity]u8
+var buffer      ^buffer_type|none
 var buffer_view []u8
-var frame       [screen.size]u8
+var frame       ^frame_buffer|none
 var cursor      s64
 var top_row     s64
 
-fn put_ch (col s64, row s64, ch u8):
-  frame[row * screen.width + col] = ch;;
+fn put_ch (col s64, row s64, ch u8) {
+  guard frame | return none;
+  frame^[row * screen.width + col] = ch;
+}
 
-fn present ():
-  screen.blit frame, screen.normal;;
+fn present () {
+  guard frame | return none;
+  screen.blit frame^, screen.normal;
+}
 
 fn redraw (cursor_col& s64, cursor_row& s64)
       w    s64,
@@ -38,9 +47,10 @@ fn redraw (cursor_col& s64, cursor_row& s64)
       col  s64,
       row  s64,
       i    s64,
-      ch   u8:
-  screen.hide_cursor;
-  bytes.clear frame&;
+      ch   u8 {
+  guard frame | return none;
+  tty.hide_cursor;
+  bytes.clear frame^&;
   w    = screen.width;
   rows = screen.height;
   n    = length buffer_view;
@@ -49,27 +59,34 @@ fn redraw (cursor_col& s64, cursor_row& s64)
   i    = 0;
   cursor_col = 0;
   cursor_row = 0;
-  for i < n:
-    if i == cursor then:
+  for i < n {
+    if i == cursor {
       cursor_col = col;
-      cursor_row = row;;
+      cursor_row = row;
+    }
     ch = buffer_view[i];
-    if ch == newline then:
+    if ch == newline {
       row = row + 1;
       col = 0;
-    ; else if ch != cr then:
-      if and (row >= top_row), (row < top_row + rows) then:
-        put_ch col, (row - top_row), ch;;
+    } else if ch != cr {
+      if and (row >= top_row), (row < top_row + rows) {
+        put_ch col, (row - top_row), ch;
+      }
       col = col + 1;
-      if col >= w then:
+      if col >= w {
         col = 0;
-        row = row + 1;;;
-    i = i + 1;;
-  if cursor >= n then:
+        row = row + 1;
+      }
+    }
+    i = i + 1;
+  }
+  if cursor >= n {
     cursor_col = col;
-    cursor_row = row;;
+    cursor_row = row;
+  }
   present;
-  return none;;
+  return none;
+}
 
 fn locate_cursor (cursor_col& s64, cursor_row& s64)
       w   s64,
@@ -77,7 +94,7 @@ fn locate_cursor (cursor_col& s64, cursor_row& s64)
       col s64,
       row s64,
       i   s64,
-      ch  u8:
+      ch  u8 {
   w   = screen.width;
   n   = length buffer_view;
   col = 0;
@@ -85,24 +102,29 @@ fn locate_cursor (cursor_col& s64, cursor_row& s64)
   i   = 0;
   cursor_col = 0;
   cursor_row = 0;
-  for i < n:
-    if i == cursor then:
+  for i < n {
+    if i == cursor {
       cursor_col = col;
       cursor_row = row;
-      return none;;
+      return none;
+    }
     ch = buffer_view[i];
-    if ch == newline then:
+    if ch == newline {
       row = row + 1;
       col = 0;
-    ; else if ch != cr then:
+    } else if ch != cr {
       col = col + 1;
-      if col >= w then:
+      if col >= w {
         col = 0;
-        row = row + 1;;;
-    i = i + 1;;
+        row = row + 1;
+      }
+    }
+    i = i + 1;
+  }
   cursor_col = col;
   cursor_row = row;
-  return none;;
+  return none;
+}
 
 fn byte_at_visual s64 (target_col s64, target_row s64)
       w    s64,
@@ -111,173 +133,203 @@ fn byte_at_visual s64 (target_col s64, target_row s64)
       row  s64,
       i    s64,
       ch   u8,
-      best s64:
+      best s64 {
   w    = screen.width;
   n    = length buffer_view;
   col  = 0;
   row  = 0;
   i    = 0;
   best = -1;
-  for i < n:
-    if row == target_row then:
+  for i < n {
+    if row == target_row {
       best = i;
-      if col >= target_col then: return i;;;
-    if row > target_row then:
-      if best >= 0 then: return best;;
-      return i;;
+      if col >= target_col { return i; }
+    }
+    if row > target_row {
+      if best >= 0 { return best; }
+      return i;
+    }
     ch = buffer_view[i];
-    if ch == newline then:
+    if ch == newline {
       row = row + 1;
       col = 0;
-    ; else if ch != cr then:
+    } else if ch != cr {
       col = col + 1;
-      if col >= w then:
+      if col >= w {
         col = 0;
-        row = row + 1;;;
-    i = i + 1;;
+        row = row + 1;
+      }
+    }
+    i = i + 1;
+  }
   -- end of buffer; if we ended still on target_row, the cursor at n is its end.
-  if row == target_row then: best = n;;
-  if best >= 0 then: return best;;
-  return n;;
+  if row == target_row { best = n; }
+  if best >= 0 { return best; }
+  return n;
+}
 
 fn insert_byte (ch u8)
       new_len s64,
-      dst     []u8:
+      dst     []u8 {
+  guard buffer | return none;
   new_len = (length buffer_view) + 1;
-  if new_len > max_capacity then: return none;;
-  dst = buffer[cursor + 1:new_len];
-  bytes.move buffer[cursor:length buffer_view], dst&;
-  buffer[cursor] = ch;
-  buffer_view = buffer[0:new_len];
+  if new_len > max_capacity { return none; }
+  dst = buffer^[cursor + 1:new_len];
+  bytes.move buffer^[cursor:length buffer_view], dst&;
+  buffer^[cursor] = ch;
+  buffer_view = buffer^[0:new_len];
   cursor = cursor + 1;
-  return none;;
+  return none;
+}
 
 fn delete_byte ()
       new_len s64,
-      dst     []u8:
-  if cursor == 0 then: return none;;
+      dst     []u8 {
+  guard buffer | return none;
+  if cursor == 0 { return none; }
   new_len = (length buffer_view) - 1;
-  dst = buffer[cursor - 1:new_len];
-  bytes.copy buffer[cursor:length buffer_view], dst&;
-  buffer_view = buffer[0:new_len];
+  dst = buffer^[cursor - 1:new_len];
+  bytes.copy buffer^[cursor:length buffer_view], dst&;
+  buffer_view = buffer^[0:new_len];
   cursor = cursor - 1;
-  return none;;
+  return none;
+}
 
-fn save (path string) raises
-      fh file.id:
+fn save (path string) raises storage_fault
+      fh file.id {
   fh = file.replace path;
   defer file.close fh;
   file.write fh, buffer_view;
-  return none;;
+  return none;
+}
 
 fn line_home s64 ()
       i  s64,
-      ch u8:
+      ch u8 {
   -- back up to the start of the current logical line
   i = cursor;
-  for i > 0:
-    if buffer_view[i - 1] == newline then: break;;
-    i = i - 1;;
+  for i > 0 {
+    if buffer_view[i - 1] == newline { break; }
+    i = i - 1;
+  }
   -- skip leading spaces and tabs, but never cross the next newline
-  for i < length buffer_view:
+  for i < length buffer_view {
     ch = buffer_view[i];
-    if ch == newline then: break;;
-    if and (ch != ' '), (ch != tab) then: break;;
-    i = i + 1;;
-  return i;;
+    if ch == newline { break; }
+    if and (ch != ' '), (ch != tab) { break; }
+    i = i + 1;
+  }
+  return i;
+}
 
 fn line_end s64 ()
-      i s64:
+      i s64 {
   i = cursor;
-  for i < length buffer_view:
-    if buffer_view[i] == newline then: break;;
-    i = i + 1;;
-  return i;;
+  for i < length buffer_view {
+    if buffer_view[i] == newline { break; }
+    i = i + 1;
+  }
+  return i;
+}
 
 fn enter_line ()
       start s64,
       count s64,
-      i     s64:
+      i     s64 {
   -- back up to the start of the current logical line
   start = cursor;
-  for start > 0:
-    if buffer_view[start - 1] == newline then: break;;
-    start = start - 1;;
+  for start > 0 {
+    if buffer_view[start - 1] == newline { break; }
+    start = start - 1;
+  }
   -- count leading spaces, not crossing the cursor
   count = 0;
   i = start;
-  for i < cursor:
-    if buffer_view[i] != ' ' then: break;;
+  for i < cursor {
+    if buffer_view[i] != ' ' { break; }
     count = count + 1;
-    i = i + 1;;
+    i = i + 1;
+  }
   insert_byte newline;
   i = 0;
-  for i < count; i += 1:
-    insert_byte ' ';;
-  return none;;
+  for i < count; i += 1 {
+    insert_byte ' ';
+  }
+  return none;
+}
 
-fn in (path string) raises
+fn in (path string) raises data_fault, storage_fault, resource_fault
       k    screen.key,
       col  s64,
       row  s64,
       ccol s64,
-      crow s64:
-  if (file.size path) > max_capacity then: raise buffer_overflow;;
+      crow s64 {
+  if (file.size path) > max_capacity { raise data_fault.buffer_overflow; }
   h = file.open path;
   defer file.close h;
-  buffer_view = file.read h, buffer&;
+  buffer = heap.claim buffer_type;
+  defer heap.release buffer;
+  frame = heap.claim frame_buffer;
+  defer heap.release frame;
+  guard buffer | return none;
+  buffer_view = file.read h, buffer^&;
   screen.snapshot;
   defer screen.restore;
   cursor  = 0;
   top_row = 0;
   redraw ccol&, crow&;
-  screen.at ccol, (crow - top_row);
-  screen.show_cursor;
-  for:
-    if not (screen.poll_key k&) then: continue;;
-    if not (k.is_key_down) then: continue;;
+  tty.at ccol, (crow - top_row);
+  tty.show_cursor;
+  for {
+    if not (screen.poll_key k&) { continue; }
+    if not (k.is_key_down) { continue; }
     -- Ctrl+Q exits.
-    if and (k.code == 'q'), k.is_ctrl_pressed then: return none;;
+    if and (k.code == 'q'), k.is_ctrl_pressed { return none; }
     -- Ctrl+S saves.
-    if and (k.code == 's'), k.is_ctrl_pressed then:
+    if and (k.code == 's'), k.is_ctrl_pressed {
       save path;
-      continue;;
-    if k.is_control_key then:
-      if k.code == screen.key_arrow_left then:
-        if cursor > 0 then: cursor = cursor - 1;;;
-      else if k.code == screen.key_arrow_right then:
-        if cursor < length buffer_view then: cursor = cursor + 1;;;
-      else if k.code == screen.key_arrow_up then:
+      continue;
+    }
+    if k.is_control_key {
+      if k.code == screen.key_arrow_left {
+        if cursor > 0 { cursor = cursor - 1; }
+      } else if k.code == screen.key_arrow_right {
+        if cursor < length buffer_view { cursor = cursor + 1; }
+      } else if k.code == screen.key_arrow_up {
         locate_cursor col&, row&;
-        if row > 0 then: cursor = byte_at_visual col, (row - 1);;;
-      else if k.code == screen.key_arrow_down then:
+        if row > 0 { cursor = byte_at_visual col, (row - 1); }
+      } else if k.code == screen.key_arrow_down {
         locate_cursor col&, row&;
-        cursor = byte_at_visual col, (row + 1);;
-      else if k.code == screen.key_page_up then:
+        cursor = byte_at_visual col, (row + 1);
+      } else if k.code == screen.key_page_up {
         locate_cursor col&, row&;
-        cursor = byte_at_visual col, (row - screen.height / 2);;
-      else if k.code == screen.key_page_down then:
+        cursor = byte_at_visual col, (row - screen.height / 2);
+      } else if k.code == screen.key_page_down {
         locate_cursor col&, row&;
-        cursor = byte_at_visual col, (row + screen.height / 2);;
-      else if k.code == screen.key_home then:
-        cursor = line_home;;
-      else if k.code == screen.key_end then:
-        cursor = line_end;;
-      else if k.code == screen.key_backspace then:
-        delete_byte;;
-      else if k.code == screen.key_tab then:
+        cursor = byte_at_visual col, (row + screen.height / 2);
+      } else if k.code == screen.key_home {
+        cursor = line_home;
+      } else if k.code == screen.key_end {
+        cursor = line_end;
+      } else if k.code == screen.key_backspace {
+        delete_byte;
+      } else if k.code == screen.key_tab {
         insert_byte ' ';
-        insert_byte ' ';;
-      else if k.code == screen.key_enter then:
-        enter_line;;
-    ; else if not (k.is_ctrl_pressed) then:
+        insert_byte ' ';
+      } else if k.code == screen.key_enter {
+        enter_line;
+      }
+    } else if not (k.is_ctrl_pressed) {
       insert_byte k.code;
-    ; else:
-      continue;;
+    } else {
+      continue;
+    }
     locate_cursor col&, row&;
-    if row < top_row then: top_row = row;;
-    if row >= top_row + screen.height then: top_row = row - screen.height + 1;;
+    if row < top_row { top_row = row; }
+    if row >= top_row + screen.height { top_row = row - screen.height + 1; }
     redraw ccol&, crow&;
-    screen.at ccol, (crow - top_row);
-    screen.show_cursor;;
-  return none;;
+    tty.at ccol, (crow - top_row);
+    tty.show_cursor;
+  }
+  return none;
+}
