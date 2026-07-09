@@ -7,18 +7,20 @@
 -- license: cc-by-sa 4.0
 --
 
-import 'core/clock, 'core/random, 'core/screen,
+import 'core/bytes, 'core/logic, 'core/resource, 'core/clock, 'core/random, 'core/screen,
   'core/task, 'core/heap, 'core/text
 
 fn play()
-    raises logic_fault, data_fault, resource_fault
+    raises logic.fault, bytes.fault, resource.fault
 
-body
+...
 
 const board_x   = 37
 const board_y   = 10
 const board_w   = 60
+const board_w_2 = 30
 const board_h   = 24
+const board_h_2 = 12
 const max_len   = 1024
 const ring_mask = 1023  -- masks the ring index
 const tick_ms   = 100
@@ -38,17 +40,17 @@ type state record {
 fn handle_input (st& state) ...
 fn try_turn (st& state, nx s64, ny s64) ...
 fn reset (st& state, sx& coords, sy& coords)
-  raises logic_fault ...
+  raises logic.fault ...
 fn place_food (st& state, sx coords, sy coords)
-  raises logic_fault ...
+  raises logic.fault ...
 fn step (st& state, sx& coords, sy& coords)
-  raises logic_fault ...
+  raises logic.fault ...
 fn draw (fr& frame, st state, sx coords, sy coords)
-  raises data_fault, logic_fault ...
+  raises bytes.fault, logic.fault ...
 
 -- entry point: snapshot the screen, seed, draw, run until quit
 fn play ()
-  raises logic_fault, data_fault, resource_fault
+  raises logic.fault, bytes.fault, resource.fault
   var st ^state, snake_x ^coords, snake_y ^coords
   var fr ^frame, last s64 {
 
@@ -115,10 +117,11 @@ fn try_turn (st& state, nx s64, ny s64)
 
 -- (re)initialise the snake at the centre and drop the first food
 fn reset (st& state, sx& coords, sy& coords)
-  raises logic_fault {
+  raises logic.fault {
+
   st.head = 0; st.tail = 0;
-  sx[0] = board_x + board_w / 2;
-  sy[0] = board_y + board_h / 2;
+  sx[0] = board_x + board_w_2;
+  sy[0] = board_y + board_h_2;
   st.dir_x = 1; st.dir_y = 0;
   st.score = 0;
   place_food st&, sx, sy;
@@ -127,7 +130,7 @@ fn reset (st& state, sx& coords, sy& coords)
 
 -- pick a random empty cell for the next food
 fn place_food (st& state, sx coords, sy coords)
-  raises logic_fault
+  raises logic.fault
   var i s64, e s64, collision bool {
 
   e = and (st.head + 1), ring_mask;
@@ -145,20 +148,22 @@ fn place_food (st& state, sx coords, sy coords)
 
 -- advance one tick: move the head, handle walls, growth, and eating
 fn step (st& state, sx& coords, sy& coords)
-  raises logic_fault
-  var nx s64, ny s64, new_head s64 {
+  raises logic.fault
+  var nx s64, ny s64, new_head s64
+  var outside bool, ate_food bool {
 
   nx = sx[st.head] + st.dir_x;
   ny = sy[st.head] + st.dir_y;
-  if or (nx < board_x), (nx >= board_x + board_w),
-        (ny < board_y), (ny >= board_y + board_h) {
-    return st.quit = true;
-  }
+  outside = or
+    (nx < board_x), (nx >= board_x + board_w),
+    (ny < board_y), (ny >= board_y + board_h);
+  if outside { return st.quit = true; }
   new_head = and (st.head + 1), ring_mask;
   sx[new_head] = nx;
   sy[new_head] = ny;
   st.head = new_head;
-  if and (nx == st.food_x), (ny == st.food_y) {
+  ate_food = and (nx == st.food_x), (ny == st.food_y);
+  if ate_food {
     st.score += 1;
     place_food st&, sx, sy;
   } else {
@@ -168,19 +173,23 @@ fn step (st& state, sx& coords, sy& coords)
 
 -- redraw the whole: clear, border, title, snake, food, score
 fn draw (fr& frame, st state, sx coords, sy coords)
-  raises data_fault, logic_fault
+  raises bytes.fault, logic.fault
   var i s64, off s64, e s64, buffer [64]u8 {
 
   screen.clear fr&;
   screen.bottom fr&, " ctrl+q: quit";
+
   screen.frame fr&, (board_x - 1), (board_y - 1),
     (board_w + 2), (board_h + 2);
-  e = and (st.head + 1), ring_mask;
+
+  e = and (st.head), ring_mask;
   i = st.tail; for i != e; i = and (i + 1), ring_mask {
-    off = sy[i] * screen.width + sx[i];
-    fr[off] = if i == st.head { '@'; } else { 'o'; };
+    fr[sy[i] * screen.width + sx[i]] = 'o';
   }
+  fr[sy[st.head] * screen.width + sx[st.head]] = '@';
+  
   fr[st.food_y * screen.width + st.food_x] = '*';
+
   screen.print fr&, (board_x - 1), (board_y - 2),
     (text.format buffer&, "score: ", st.score);
   screen.blit fr, screen.normal;

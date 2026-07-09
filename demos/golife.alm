@@ -7,27 +7,25 @@
 -- license: cc-by-sa 4.0
 --
 
-import 'core/clock, 'core/random, 'core/boolean,
+import 'core/bytes, 'core/logic, 'core/resource, 'core/clock, 'core/random, 'core/boolean,
   'core/screen, 'core/task, 'core/heap, 'core/text
 
-fn play() raises logic_fault, data_fault, resource_fault
+fn play()
+  raises logic.fault, bytes.fault, resource.fault
 
-body
+...
 
-const board_x       = 3
+const board_x       = 28
 const board_y       = 3
-const board_h       = 40
-const board_w       = 128 -- should be power of 2
-const grid_size     = 5120 -- board_w * board_h
+const board_h       = 34
+const board_w       = 64 -- should be power of 2
+const grid_size     = 2176 -- board_w * board_h
 const tick_ms       = 100
 const live_density  = 30 -- for reset
 
 
 -- state
 
--- the two grids and the frame live on the heap only while the demo runs; they
--- are claimed as non-null locals in `play` and threaded as parameters, so the
--- workers need no guard.
 type cell_buffer  [grid_size]bool
 type frame_buffer [screen.size]u8
 
@@ -39,7 +37,7 @@ var population   s64
 
 -- count live neighbours of cell `i` (its column is `x`)
 fn count_neighbors s64 (x s64, i s64, cs ^cell_buffer)
-    n s64, left bool, right bool, up bool, down bool {
+    var n s64, left bool, right bool, up bool, down bool {
   n = 0;
   left = x != 0; right = x != board_w - 1;
   up = i >= board_w; down = i < grid_size - board_w;
@@ -57,7 +55,7 @@ fn count_neighbors s64 (x s64, i s64, cs ^cell_buffer)
 
 -- advance one generation: update cells, population, generation
 fn step (cs ^cell_buffer, nx ^cell_buffer)
-    n s64, born bool, i s64, p s64, x s64 {
+    var n s64, born bool, i s64, p s64, x s64 {
   p = 0; x = 0;
   i = 0; for i != grid_size; i += 1 {
     n = count_neighbors x, i, cs;
@@ -76,8 +74,8 @@ fn step (cs ^cell_buffer, nx ^cell_buffer)
 
 -- reseed cells with live_density% alive; zero generation, recount population
 fn reset (cs ^cell_buffer)
-    raises logic_fault
-    i s64, p s64 {
+    raises logic.fault
+    var i s64, p s64 {
   p = 0;
   i = 0; for i != grid_size; i += 1 {
     if (random.range entropy&, 0, 100) < live_density {
@@ -96,8 +94,8 @@ fn reset (cs ^cell_buffer)
 
 -- redraw the frame: border, live cells, then blit
 fn draw (fr ^frame_buffer, cs ^cell_buffer)
-    raises data_fault, logic_fault
-    x s64, y s64, i s64, j s64, buffer [128]u8 {
+    raises bytes.fault, logic.fault
+    var x s64, y s64, i s64, j s64, buffer [128]u8 {
   screen.clear fr^&;
   screen.bottom fr^&,
     " space: pause, r: reset, ctrl+q: quit";
@@ -126,8 +124,8 @@ var quit bool
 
 -- drain pending key events; toggle pause, trigger reset, or quit
 fn handle_input (fr ^frame_buffer, cs ^cell_buffer)
-    raises data_fault, logic_fault
-    k screen.key {
+    raises bytes.fault, logic.fault
+    var k screen.key {
 
   for screen.poll_key k& {
     if not (k.is_key_down) { continue; }
@@ -147,31 +145,31 @@ fn handle_input (fr ^frame_buffer, cs ^cell_buffer)
 
 -- entry point: snapshot the screen, seed, paint, run until quit
 fn play ()
-    raises logic_fault, data_fault, resource_fault
-    last clock.tick, cells ^cell_buffer, next_cells ^cell_buffer, frame ^frame_buffer {
+    raises logic.fault, bytes.fault, resource.fault
+    var last clock.tick, cs ^cell_buffer, next_cs ^cell_buffer, frame ^frame_buffer {
 
-  cells = heap.claim cell_buffer;
-  defer heap.release cells;
-  next_cells = heap.claim cell_buffer;
-  defer heap.release next_cells;
+  cs = heap.claim cell_buffer;
+  defer heap.release cs;
+  next_cs = heap.claim cell_buffer;
+  defer heap.release next_cs;
   frame = heap.claim frame_buffer;
   defer heap.release frame;
   screen.snapshot;
   defer screen.restore;
 
   random.seed entropy&, clock.now;
-  reset cells; draw frame, cells;
+  reset cs; draw frame, cs;
 
   paused = false;
   last = clock.now;
 
   quit = false; for not quit {
-    handle_input frame, cells;
+    handle_input frame, cs;
     if or paused, (clock.elapsed_ms last < tick_ms) {
       task.yield;
       continue;
     }
     last = clock.now;
-    step cells, next_cells; draw frame, cells;
+    step cs, next_cs; draw frame, cs;
   }
 }

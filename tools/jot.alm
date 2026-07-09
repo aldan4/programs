@@ -7,11 +7,11 @@
 -- license: cc-by-sa 4.0
 --
 
-import 'core/bytes, 'core/screen, 'core/tty, 'core/file, 'core/heap
+import 'core/storage, 'core/resource, 'core/bytes, 'core/screen, 'core/tty, 'core/file, 'core/heap, 'core/task
 
-fn in (path string) raises data_fault, storage_fault, resource_fault
+fn in (path string) raises bytes.fault, storage.fault, resource.fault
 
-body
+...
 
 const max_capacity = 65536
 const tab          = 9
@@ -41,7 +41,7 @@ fn present () {
 }
 
 fn redraw (cursor_col& s64, cursor_row& s64)
-      w    s64,
+      var w    s64,
       rows s64,
       n    s64,
       col  s64,
@@ -89,7 +89,7 @@ fn redraw (cursor_col& s64, cursor_row& s64)
 }
 
 fn locate_cursor (cursor_col& s64, cursor_row& s64)
-      w   s64,
+      var w   s64,
       n   s64,
       col s64,
       row s64,
@@ -127,7 +127,7 @@ fn locate_cursor (cursor_col& s64, cursor_row& s64)
 }
 
 fn byte_at_visual s64 (target_col s64, target_row s64)
-      w    s64,
+      var w    s64,
       n    s64,
       col  s64,
       row  s64,
@@ -169,7 +169,7 @@ fn byte_at_visual s64 (target_col s64, target_row s64)
 }
 
 fn insert_byte (ch u8)
-      new_len s64,
+      var new_len s64,
       dst     []u8 {
   guard buffer | return none;
   new_len = (length buffer_view) + 1;
@@ -183,7 +183,7 @@ fn insert_byte (ch u8)
 }
 
 fn delete_byte ()
-      new_len s64,
+      var new_len s64,
       dst     []u8 {
   guard buffer | return none;
   if cursor == 0 { return none; }
@@ -195,8 +195,8 @@ fn delete_byte ()
   return none;
 }
 
-fn save (path string) raises storage_fault
-      fh file.id {
+fn save (path string) raises storage.fault
+      var fh file.id {
   fh = file.replace path;
   defer file.close fh;
   file.write fh, buffer_view;
@@ -204,7 +204,7 @@ fn save (path string) raises storage_fault
 }
 
 fn line_home s64 ()
-      i  s64,
+      var i  s64,
       ch u8 {
   -- back up to the start of the current logical line
   i = cursor;
@@ -223,7 +223,7 @@ fn line_home s64 ()
 }
 
 fn line_end s64 ()
-      i s64 {
+      var i s64 {
   i = cursor;
   for i < length buffer_view {
     if buffer_view[i] == newline { break; }
@@ -233,7 +233,7 @@ fn line_end s64 ()
 }
 
 fn enter_line ()
-      start s64,
+      var start s64,
       count s64,
       i     s64 {
   -- back up to the start of the current logical line
@@ -258,13 +258,13 @@ fn enter_line ()
   return none;
 }
 
-fn in (path string) raises data_fault, storage_fault, resource_fault
-      k    screen.key,
+fn in (path string) raises bytes.fault, storage.fault, resource.fault
+      var k    screen.key,
       col  s64,
       row  s64,
       ccol s64,
       crow s64 {
-  if (file.size path) > max_capacity { raise data_fault.buffer_overflow; }
+  if (file.size path) > max_capacity { raise bytes.fault.buffer_overflow; }
   h = file.open path;
   defer file.close h;
   buffer = heap.claim buffer_type;
@@ -281,7 +281,7 @@ fn in (path string) raises data_fault, storage_fault, resource_fault
   tty.at ccol, (crow - top_row);
   tty.show_cursor;
   for {
-    if not (screen.poll_key k&) { continue; }
+    if not (screen.poll_key k&) { task.yield; continue; }
     if not (k.is_key_down) { continue; }
     -- Ctrl+Q exits.
     if and (k.code == 'q'), k.is_ctrl_pressed { return none; }

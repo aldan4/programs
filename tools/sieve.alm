@@ -7,7 +7,7 @@
 -- license: cc-by-sa 4.0
 --
 
-import 'core/clock, 'core/boolean, 'core/task,
+import 'core/logic, 'core/resource, 'core/clock, 'core/boolean, 'core/task,
   'core/heap
 
 -- sieve `numbers` in place and
@@ -16,9 +16,10 @@ fn find s64 (numbers& []bool)
 
 -- benchmark `find` and return
 -- the maximum iterations-per-second
-fn run s64 () raises logic_fault, resource_fault
+fn run s64 ()
+  raises logic.fault, resource.fault
 
-body
+...
 
 const size         = 8190
 const primes_count = 1899
@@ -28,7 +29,7 @@ const window_ms    = 50
 -- sieve `numbers` in place and
 -- return the count of primes found
 fn find s64 (numbers& []bool)
-    i s64, count s64, k s64, prime s64, n s64 {
+  var i s64, count s64, k s64, prime s64, n s64 {
 
   -- reset the sieve
   boolean.fill numbers&, true;
@@ -53,23 +54,23 @@ fn find s64 (numbers& []bool)
 
 -- only odd numbers are tracked: flags[i] stands
 -- for the odd number 2*i + 3
-type flags_buffer [size]bool
+type flags [size]bool
 
 -- benchmark `find` and return
 -- the maximum iterations-per-second
 fn run s64 ()
-    raises logic_fault, resource_fault    
-    flags ^flags_buffer, si s64, ipw s64,
-    count s64, ips s64, best_ips s64,
+    raises logic.fault, resource.fault
+
+    var fs ^flags, si s64,
+    ipw s64, ips s64, best_ips s64,
     started clock.tick, actual_ms s64 {
 
-  flags = heap.claim flags_buffer;
-  defer heap.release flags;
+  fs = heap.claim flags;
+  defer heap.release fs;
 
   -- check algorithm is correct
-  count = find flags^&;
-  if count != primes_count {
-    raise logic_fault.contract_failed;
+  if find fs^& != primes_count {
+    raise logic.fault.contract_failed;
   }
 
   -- calculate several times to get best ips
@@ -81,7 +82,7 @@ fn run s64 ()
     actual_ms = clock.elapsed_ms started;
     for actual_ms <= window_ms;
         actual_ms = clock.elapsed_ms started {
-      find flags^&;
+      find fs^&;
       ipw += 1;
     }
 
