@@ -1,0 +1,186 @@
+--
+-- plot -- a grafal vector-graphics viewer for the aldan 4
+-- usage:
+--      plot.show 'plots/vicsek.gfal
+-- authors:
+--      ortfero <ortfero@gmail.com>, 2026
+-- license: cc-by-sa 4.0
+--
+-- grafal is a line-oriented ascii format for 2-d line art (see tools/grafal):
+-- a ":file grafal" magic line, an optional ":plane w h", then move/plot commands
+-- "m <x> <y>" (pen up) and "p <x> <y>" (pen down, stroke from the current point).
+-- coordinates are pixels in the 720x480 vdp plane, so the viewer maps each line
+-- straight onto a vdp display-list command -- "m" to move, "p" to line -- and
+-- hands the list to machine.video_present. see programs/demos/lines for the
+-- command bit layout.
+--
+-- the whole file is read into a heap text buffer and parsed in memory into a
+-- second heap buffer of 64-bit commands; both are released on exit. the drawing
+-- is capped at list_cap commands (a picture that large is truncated with a note),
+-- and files larger than text_cap are refused.
+--
+
+import 'core/storage, 'core/bytes, 'core/logic, 'core/resource,
+  'core/file, 'core/heap, 'core/signed,
+  'core/screen, 'core/tty, 'core/task, 'aldos/machine, 'core/bit
+
+fn show (path string) raises storage.fault | bytes.fault | logic.fault | resource.fault
+
+...
+
+-- opcodes (host.hpp): none=0, data=1, text=2, move=3, line=4
+const op_move = 3
+const op_line = 4
+const normal  = 2            -- intensity 2 = solid amber, matching the console text
+
+const text_cap = 65536       -- largest grafal file we load (bytes)
+const list_cap = 8192        -- display-list slots; one reserved for the terminator
+
+type text_buffer   [65536]u8
+type command_list  [8192]b64
+
+-- the two heap buffers, held as pointers in bss and claimed only while a file is
+-- open (see `show`), then freed.
+var text ^text_buffer|none
+var cmds ^command_list|none
+
+
+-- pack a move command: op | (x & 0xfff) << 8 | (y & 0xfff) << 20
+fn cmd_move b64 (x s64, y s64) var r b64 {
+  r = or (op_move as b64), (bit.shil (and (x as b64), (0xfff as b64)), 8);
+  return or r, (bit.shil (and (y as b64), (0xfff as b64)), 20);
+}
+
+-- pack a line command: the move fields plus intensity in bits 32-33
+fn cmd_line b64 (x s64, y s64) var r b64 {
+  r = or (op_line as b64), (bit.shil (and (x as b64), (0xfff as b64)), 8);
+  r = or r, (bit.shil (and (y as b64), (0xfff as b64)), 20);
+  return or r, (bit.shil (normal as b64), 32);
+}
+
+
+-- true when `view` begins with the bytes of `prefix`
+fn starts_with bool (view []u8, prefix string) var i s64, n s64 {
+  n = length prefix;
+  if (length view) < n { return false; }
+  i = 0;
+  for i < n {
+    if view[i] != prefix[i] { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+-- parse the decimal integer token at or after `pos` in `view`, advancing `pos`
+-- past it. spaces and tabs separate tokens; a missing token is a format error.
+fn next_int s64 (view []u8, var pos s64) raises logic.fault | bytes.fault
+    var n s64, start s64 {
+  n = length view;
+  for and (pos < n), (or (view[pos] == ' '), (view[pos] == (9 as u8))) { pos = pos + 1; }
+  start = pos;
+  for and (pos < n), (view[pos] != ' '), (view[pos] != (9 as u8)) { pos = pos + 1; }
+  if pos == start { raise bytes.fault.invalid_format; }
+  return signed.parse (view[start:pos]);
+}
+
+-- parse the grafal text in `view` into the command list, returning the command
+-- count (before the terminator). the first non-blank line must be the magic.
+fn build s64 (view []u8) raises logic.fault | bytes.fault
+    var n s64, i s64, len s64, ls s64, cs s64, seen bool, c u8, pos s64, x s64, y s64 {
+  guard cmds | return 0;
+  n = 0;
+  seen = false;
+  len = length view;
+  i = 0;
+  for i < len {
+    -- carve the line [ls, i)
+    ls = i;
+    for and (i < len), (view[i] != (10 as u8)) { i = i + 1; }
+    -- first non-blank column in the line
+    cs = ls;
+    for and (cs < i), (or (view[cs] == ' '), (view[cs] == (13 as u8)), (view[cs] == (9 as u8))) {
+      cs = cs + 1;
+    }
+    if i > cs {
+      c = view[cs];
+      if not seen {
+        if not (starts_with (view[cs:i]), ":file grafal") { raise bytes.fault.invalid_format; }
+        seen = true;
+      } else {
+        if or (c == 'm'), (c == 'p') {
+          if n >= (list_cap - 1) {
+            tty.say "plot: drawing truncated (too many commands)";
+            return n;
+          }
+          pos = 1;
+          x = next_int (view[cs:i]), var pos;
+          y = next_int (view[cs:i]), var pos;
+          if c == 'm' { cmds^[n] = cmd_move x, y; }
+          else { cmds^[n] = cmd_line x, y; }
+          n = n + 1;
+        }
+        -- ":" directives and any other line are ignored
+      }
+    }
+    i = i + 1;             -- step over the newline
+  }
+  return n;
+}
+
+
+-- entry point: read the file, parse it into a display list, present it, wait
+-- for esc/q, restore the console.
+fn show (path string) raises storage.fault | bytes.fault | logic.fault | resource.fault
+    var h file.id, fsz s64, off s64, b []u8, view []u8, got s64, n s64,
+    k screen.key, quit bool {
+
+  fsz = file.size path;
+  if fsz > text_cap {
+    tty.say "plot: file too large";
+    return none;
+  }
+
+  text = heap.claim text_buffer;
+  defer heap.release from text;
+  cmds = heap.claim command_list;
+  defer heap.release from cmds;
+  guard text | return none;
+
+  h = file.open path;
+  defer file.close h;
+
+  -- read the whole file into the text buffer
+  off = 0;
+  for off < fsz {
+    b = text^[off:text_cap];
+    view = file.read h, var b;
+    got = length view;
+    if got == 0 { break; }
+    off = off + got;
+  }
+
+  n = build (text^[0:off]);
+
+  guard cmds | return none;
+  cmds^[n] = 0 as b64;         -- none: display-list terminator
+  n = n + 1;
+
+  screen.snapshot;
+  defer screen.restore;
+  tty.hide_cursor;
+  defer tty.show_cursor;
+
+  machine.video_present (cmds^[0:n]);
+
+  quit = false;
+  for not quit {
+    for screen.poll_key var k {
+      if not (k.is_key_down) { continue; }
+      when k.code {
+      | screen.key_esc: quit = true;
+      | 'q': quit = true;
+      }
+    }
+    task.yield;
+  }
+}

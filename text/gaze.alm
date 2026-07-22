@@ -7,15 +7,15 @@
 -- license: cc-by-sa 4.0
 --
 
-import 'core/bytes, 'core/screen, 'core/task, 'core/file, 'core/heap, 'core/text
+import 'core/storage, 'core/resource, 'core/bytes, 'core/screen, 'core/task, 'core/file, 'core/heap, 'core/text
 
-fn at (path string) raises storage_fault, data_fault, resource_fault
+fn at (path string) raises storage.fault | bytes.fault | resource.fault
 
-body
+...
 
 const chunk_cap    = 16384
-const narrow_width = 70
-const wide_width   = 135
+const narrow_width = 72
+const wide_width   = 120
 const newline      = 10     const cr  = 13
 
 -- the read buffer is held as a pointer (8 bytes in bss) and the 16KB is
@@ -40,33 +40,33 @@ var frame      ^frame_buffer|none
 
 -- draw the bottom status bar: how far `bottom_off` sits into the file as a
 -- percentage, plus the quit hint
-fn draw_status (bottom_off s64) raises data_fault
-    percent s64, buffer [64]u8 {
+fn draw_status (bottom_off s64) raises bytes.fault
+    var percent s64, buffer [64]u8 {
   guard frame | return none;
   percent = if file_size > 0 {
     (bottom_off * 100) / file_size;
   } else {
     100;
   };
-  screen.bottom frame^&,
-    (text.format buffer&, " ", percent, "% | w: wide, ctrl+q: quit");
+  screen.bottom var frame^,
+    (text.format var buffer, " ", percent, "% | w: wide, ctrl+q: quit");
 }
 
 
 -- redraw the whole frame from scratch: read the page at top_offset, word-wrap
 -- it into the centred column, draw the status bar, then blit
-fn draw () raises storage_fault, data_fault
-    left s64, rows s64, row s64, col s64,
+fn draw () raises storage.fault | bytes.fault
+    var left s64, rows s64, row s64, col s64,
     i s64, j s64, word_len s64, ch u8 {
   guard frame | return none;
   guard chunk | return none;
-  bytes.clear frame^&;
+  bytes.clear var frame^;
   left = (screen.width - text_width) / 2;
   if left < 0 { left = 0; }
   -- reserve the last row for the status bar
   rows = screen.height - 1;
   file.seek handle, top_offset;
-  chunk_view = file.read handle, chunk^&;
+  chunk_view = file.read handle, var chunk^;
   row = 0;
   col = 0;
   i = 0;
@@ -133,8 +133,8 @@ fn draw () raises storage_fault, data_fault
 -- keep next_row's wrap logic in sync with draw.
 
 -- byte offset where the visual row after the one beginning at `start` begins
-fn next_row s64 (start s64) raises storage_fault
-      view     []u8,
+fn next_row s64 (start s64) raises storage.fault
+      var view     []u8,
       i        s64,
       col      s64,
       j        s64,
@@ -142,7 +142,7 @@ fn next_row s64 (start s64) raises storage_fault
       ch       u8 {
   guard chunk | return start;
   file.seek handle, start;
-  view = file.read handle, chunk^&;
+  view = file.read handle, var chunk^;
   i = 0;
   col = 0;
   for i < length view {
@@ -175,8 +175,8 @@ fn next_row s64 (start s64) raises storage_fault
 }
 
 -- byte offset of the start of the source line that contains `off`
-fn line_head s64 (off s64) raises storage_fault
-      base s64,
+fn line_head s64 (off s64) raises storage.fault
+      var base s64,
       span s64,
       view []u8,
       i    s64 {
@@ -186,7 +186,7 @@ fn line_head s64 (off s64) raises storage_fault
   if base < 0 { base = 0; }
   span = off - base;
   file.seek handle, base;
-  view = file.read handle, chunk^&;
+  view = file.read handle, var chunk^;
   if length view < span { span = length view; }
   i = span - 1;
   for i >= 0 {
@@ -197,8 +197,8 @@ fn line_head s64 (off s64) raises storage_fault
 }
 
 -- byte offset where the visual row immediately before `top` begins
-fn prev_row s64 (top s64) raises storage_fault
-      head s64,
+fn prev_row s64 (top s64) raises storage.fault
+      var head s64,
       o    s64,
       nxt  s64 {
   if top <= 0 { return 0; }
@@ -220,8 +220,8 @@ fn prev_row s64 (top s64) raises storage_fault
 
 -- scroll `step` visual rows in the given direction (a no-op leaves top_offset
 -- unchanged, so handle_input keeps waiting rather than redrawing)
-fn scroll_down (step s64) raises storage_fault
-    new_top s64,
+fn scroll_down (step s64) raises storage.fault
+    var new_top s64,
     nxt     s64,
     k       s64 {
   -- already showing the end of the file: nothing below to reveal
@@ -237,8 +237,8 @@ fn scroll_down (step s64) raises storage_fault
   top_offset = new_top;
 }
 
-fn scroll_up (step s64) raises storage_fault
-    new_top s64,
+fn scroll_up (step s64) raises storage.fault
+    var new_top s64,
     k       s64 {
   new_top = top_offset;
   k = 0;
@@ -251,45 +251,32 @@ fn scroll_up (step s64) raises storage_fault
 
 -- block until a key moves the view or quits, yielding the cpu while idle;
 -- returns once top_offset changed (caller redraws) or quit was requested
-fn handle_input () raises storage_fault
-    k screen.key, half s64, start s64, start_wide bool {
+fn handle_input () raises storage.fault
+    var k screen.key, half s64, start s64, start_wide bool {
   half = screen.height / 2;
   start = top_offset;
   start_wide = wide;
   for {
-    if not (screen.poll_key k&) {
+    if not (screen.poll_key var k) {
       task.yield; continue;
     }
     if not (k.is_key_down) {
       continue;
     }
-    if and (k.code == 'q'), k.is_ctrl_pressed {
-      quit = true; return none;
-    }
-    if k.code == ' ' {
-      scroll_down half;
-    }
-    if k.code == 'w' {
+    when k.code {
+    | 'q': if k.is_ctrl_pressed { quit = true; return none; }
+    | ' ': scroll_down half;
+    | 'w':
       wide = not wide;
       text_width = if wide {
         wide_width;
       } else {
         narrow_width;
       };
-    }
-    if k.is_control_key {
-      if k.code == screen.key_arrow_down {
-        scroll_down 1;
-      }
-      if k.code == screen.key_page_down {
-        scroll_down half;
-      }
-      if k.code == screen.key_arrow_up {
-        scroll_up 1;
-      }
-      if k.code == screen.key_page_up {
-        scroll_up half;
-      }
+    | screen.key_arrow_down: scroll_down 1;
+    | screen.key_page_down: scroll_down half;
+    | screen.key_arrow_up: scroll_up 1;
+    | screen.key_page_up: scroll_up half;
     }
     if or (start != top_offset), (wide != start_wide) {
       return none;
@@ -299,14 +286,14 @@ fn handle_input () raises storage_fault
 
 
 -- entry point: open the file, snapshot the screen, draw, run until quit
-fn at (path string) raises storage_fault, data_fault, resource_fault {
+fn at (path string) raises storage.fault | bytes.fault | resource.fault {
 
   handle = file.open path;
   defer file.close handle;
   chunk = heap.claim chunk_buffer;
-  defer heap.release chunk;
+  defer heap.release from chunk;
   frame = heap.claim frame_buffer;
-  defer heap.release frame;
+  defer heap.release from frame;
   file_size = file.size path;
 
   screen.snapshot;

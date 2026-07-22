@@ -1,0 +1,318 @@
+--
+-- galaxy -- a percolation model of spiral galaxies (stochastic self-propagating
+-- star formation), after gould & tobochnik, "an introduction to computer
+-- simulation methods".
+-- usage:
+--      galaxy.play
+-- authors:
+--      ortfero <ortfero@gmail.com>, 2026
+-- license: cc-by-sa 4.0
+--
+-- the disk is a set of concentric rings of cells, each ring divided so the cells
+-- are roughly square. a cell that has just formed stars ("a spark") ignites star
+-- formation in its neighbours one step later, each with probability p_prop; a few
+-- cells also ignite spontaneously (p_spont). a fresh spark shines for one step
+-- and then cannot re-ignite until its refractory counter has run down, so a
+-- travelling front of star formation leaves a fading trail behind it.
+--
+-- the rings rotate differentially -- angular speed falls off as 1 / radius, a flat
+-- rotation curve -- so the fronts are sheared into trailing spiral arms. the whole
+-- picture is a vdp display list of short strokes, one per lit cell, brightest at
+-- the leading edge and dim along the trail (see programs/demos/lines for the
+-- command bit layout, and programs/graphics/plot for the same list machinery).
+--
+-- controls: space pauses, r reseeds, esc or q quits.
+--
+
+import 'core/resource, 'core/heap, 'core/random, 'core/float, 'core/signed,
+  'core/clock, 'core/bit, 'core/screen, 'core/tty, 'core/task,
+  'aldos/machine
+
+fn play () raises resource.fault
+
+...
+
+-- opcodes (host.hpp): none=0, data=1, text=2, move=3, line=4
+const op_move = 3
+const op_line = 4
+
+-- plane geometry: the 720x480 vdp plane, galaxy centred
+const cx = 360
+const cy = 240
+
+-- ring layout: radius r0 + r * dr, rings until the cells overflow the pool
+const rings_max = 30
+const max_cells = 4096
+const r0 = 8.0
+const dr = 7.0
+const tau = 6.283185307179586
+
+-- differential rotation: angular step per tick is rot_v / radius (flat curve)
+const rot_v = 6.0
+
+-- star-formation dynamics
+const spark      = 12        -- counter set on ignition; also the refractory span
+const p_prop     = 0.28      -- per-neighbour ignition probability
+const p_spont    = 0.004     -- per-cell spontaneous ignition probability
+const seed_density = 0.06    -- fraction of cells lit on a reseed
+const tick_ms    = 70        -- simulation step period
+
+-- display list: two strokes (move + line) per lit cell, plus a terminator
+const list_cap = 8192
+
+type u8_space  [max_cells]u8
+type f64_space [max_cells]f64
+type cmd_space [list_cap]b64
+
+-- ring tables (indexed 0 .. nrings-1) and the flat cell pool geometry
+var nrings s64
+var ncells s64
+var ring_n     [rings_max]s64      -- cells in the ring
+var ring_off   [rings_max]s64      -- start index of the ring in the flat pool
+var ring_rad   [rings_max]f64      -- radius in pixels
+var ring_phase [rings_max]f64      -- current rotation angle
+var ring_omega [rings_max]f64      -- angular step per tick
+
+var entropy    random.state
+var paused     bool
+var quit       bool
+var generation s64
+
+
+-- pack a move command: op | (x & 0xfff) << 8 | (y & 0xfff) << 20
+fn cmd_move b64 (x s64, y s64) var r b64 {
+  r = or (op_move as b64), (bit.shil (and (x as b64), (0xfff as b64)), 8);
+  return or r, (bit.shil (and (y as b64), (0xfff as b64)), 20);
+}
+
+-- pack a line command with an explicit intensity in bits 32-33
+fn cmd_line b64 (x s64, y s64, inten s64) var r b64 {
+  r = or (op_line as b64), (bit.shil (and (x as b64), (0xfff as b64)), 8);
+  r = or r, (bit.shil (and (y as b64), (0xfff as b64)), 20);
+  return or r, (bit.shil (inten as b64), 32);
+}
+
+
+-- geometry --
+
+-- lay out the rings: radius, cell count (proportional to circumference so cells
+-- stay roughly square), pool offset, and angular speed. stops early if the pool
+-- would overflow.
+fn build_rings () var r s64, off s64, n s64, rad f64 {
+  off = 0;
+  r = 0; for r < rings_max; r += 1 {
+    rad = r0 + (r as f64) * dr;
+    n = signed.round (tau * rad / dr);
+    if n < 4 { n = 4; }
+    if off + n > max_cells { break; }
+    ring_rad[r] = rad;
+    ring_n[r] = n;
+    ring_off[r] = off;
+    ring_phase[r] = 0.0;
+    ring_omega[r] = rot_v / rad;
+    off = off + n;
+    nrings = r + 1;
+  }
+  ncells = off;
+}
+
+-- precompute cos/sin of each cell's base angle (its angle at zero rotation), so
+-- drawing a rotated ring is one multiply per cell instead of a trig call.
+fn build_bases (cb ^f64_space, sb ^f64_space)
+    var r s64, c s64, n s64, off s64, i s64, ang f64 {
+  r = 0; for r < nrings; r += 1 {
+    n = ring_n[r]; off = ring_off[r];
+    c = 0; for c < n; c += 1 {
+      i = off + c;
+      ang = tau * (c as f64) / (n as f64);
+      cb^[i] = float.cos ang;
+      sb^[i] = float.sin ang;
+    }
+  }
+}
+
+
+-- dynamics --
+
+-- reseed: light seed_density of the cells, zero the rotation, reset the clock
+fn reset (cur ^u8_space) var i s64 {
+  i = 0; for i < ncells; i += 1 {
+    cur^[i] = if (random.float var entropy) < seed_density { spark as u8; }
+              else { 0 as u8; };
+  }
+  i = 0; for i < nrings; i += 1 { ring_phase[i] = 0.0; }
+  generation = 0;
+}
+
+-- age every cell by one step into the next buffer (0 stays 0)
+fn decrement_into (cur ^u8_space, nxt ^u8_space) var i s64, v u8 {
+  i = 0; for i < ncells; i += 1 {
+    v = cur^[i];
+    nxt^[i] = if v > (0 as u8) { v - (1 as u8); } else { 0 as u8; };
+  }
+}
+
+-- ignite cell j in the next buffer if it is quiescent now and free next step
+fn try_ignite (cur ^u8_space, nxt ^u8_space, j s64) {
+  if cur^[j] != (0 as u8) { return none; }
+  if nxt^[j] != (0 as u8) { return none; }
+  if (random.float var entropy) < p_prop { nxt^[j] = spark as u8; }
+}
+
+-- flat index of the cell in ring rr nearest to absolute angle a
+fn ring_neighbor s64 (a f64, rr s64) var nn s64, cc s64, ph f64 {
+  nn = ring_n[rr];
+  ph = ring_phase[rr];
+  cc = signed.round ((a - ph) * (nn as f64) / tau);
+  cc = ((cc mod nn) + nn) mod nn;
+  return ring_off[rr] + cc;
+}
+
+-- spread star formation from each fresh spark to its four neighbours: the two
+-- along the ring and the nearest cell in the ring inside and outside it. the
+-- inner/outer mapping is by angle, so differential rotation shears the fronts.
+fn propagate (cur ^u8_space, nxt ^u8_space)
+    var r s64, c s64, n s64, off s64, i s64, a f64, rp f64 {
+  r = 0; for r < nrings; r += 1 {
+    n = ring_n[r]; off = ring_off[r]; rp = ring_phase[r];
+    c = 0; for c < n; c += 1 {
+      i = off + c;
+      if cur^[i] != (spark as u8) { continue; }
+      a = rp + tau * (c as f64) / (n as f64);
+      try_ignite cur, nxt, (off + ((c - 1 + n) mod n));
+      try_ignite cur, nxt, (off + ((c + 1) mod n));
+      if r > 0 { try_ignite cur, nxt, (ring_neighbor a, (r - 1)); }
+      if r < nrings - 1 { try_ignite cur, nxt, (ring_neighbor a, (r + 1)); }
+    }
+  }
+}
+
+-- a scattering of spontaneous ignitions keeps the galaxy from dying out
+fn spontaneous (cur ^u8_space, nxt ^u8_space) var i s64 {
+  i = 0; for i < ncells; i += 1 {
+    if and (cur^[i] == (0 as u8)), (nxt^[i] == (0 as u8)) {
+      if (random.float var entropy) < p_spont { nxt^[i] = spark as u8; }
+    }
+  }
+}
+
+-- advance each ring's rotation, wrapping the angle to keep it small
+fn advance_phases () var r s64 {
+  r = 0; for r < nrings; r += 1 {
+    ring_phase[r] = ring_phase[r] + ring_omega[r];
+    if ring_phase[r] > tau { ring_phase[r] = ring_phase[r] - tau; }
+  }
+}
+
+-- copy the next buffer back over the current one
+fn commit (cur ^u8_space, nxt ^u8_space) var i s64 {
+  i = 0; for i < ncells; i += 1 { cur^[i] = nxt^[i]; }
+}
+
+-- one simulation step: age, propagate, seed, rotate, commit
+fn step (cur ^u8_space, nxt ^u8_space) {
+  decrement_into cur, nxt;
+  propagate cur, nxt;
+  spontaneous cur, nxt;
+  advance_phases;
+  commit cur, nxt;
+  generation = generation + 1;
+}
+
+
+-- drawing --
+
+-- build the display list from the lit cells and hand it to the vdp. each cell is
+-- a two-pixel stroke; intensity fades with the refractory counter, so the leading
+-- edge is bright and the trail dim.
+fn draw (cur ^u8_space, cmds ^cmd_space, cb ^f64_space, sb ^f64_space)
+    var r s64, c s64, n s64, off s64, i s64, ncmd s64, x s64, y s64,
+    v u8, inten s64, cph f64, sph f64, rad f64 {
+  ncmd = 0;
+  r = 0; for r < nrings; r += 1 {
+    if ncmd + 3 >= list_cap { break; }
+    cph = float.cos (ring_phase[r]);
+    sph = float.sin (ring_phase[r]);
+    rad = ring_rad[r];
+    n = ring_n[r]; off = ring_off[r];
+    c = 0; for c < n; c += 1 {
+      v = cur^[off + c];
+      if v == (0 as u8) { continue; }
+      if ncmd + 3 >= list_cap { break; }
+      i = off + c;
+      x = signed.round ((cx as f64) + rad * (cph * cb^[i] - sph * sb^[i]));
+      y = signed.round ((cy as f64) + rad * (sph * cb^[i] + cph * sb^[i]));
+      inten = if v > ((spark * 2 / 3) as u8) { 3; }
+              else if v > ((spark / 3) as u8) { 2; }
+              else { 1; };
+      cmds^[ncmd] = cmd_move x, y; ncmd = ncmd + 1;
+      cmds^[ncmd] = cmd_line (x + 1), (y + 1), inten; ncmd = ncmd + 1;
+    }
+  }
+  cmds^[ncmd] = 0 as b64;         -- none: display-list terminator
+  ncmd = ncmd + 1;
+  machine.video_present (cmds^[0:ncmd]);
+}
+
+
+-- input --
+
+-- drain pending keys: space pauses, r reseeds, esc or q quits
+fn handle_input (cur ^u8_space, cmds ^cmd_space, cb ^f64_space, sb ^f64_space)
+    var k screen.key {
+  for screen.poll_key var k {
+    if not (k.is_key_down) { continue; }
+    when k.code {
+    | screen.key_esc: quit = true;
+    | 'q': quit = true;
+    | ' ': paused = not paused;
+    | 'r':
+      reset cur;
+      draw cur, cmds, cb, sb;
+    }
+  }
+}
+
+
+-- entry point: claim the buffers, lay out the galaxy, then run until quit
+fn play () raises resource.fault
+    var last clock.tick, cur ^u8_space, nxt ^u8_space,
+    cb ^f64_space, sb ^f64_space, cmds ^cmd_space {
+
+  cur = heap.claim u8_space;
+  defer heap.release from cur;
+  nxt = heap.claim u8_space;
+  defer heap.release from nxt;
+  cb = heap.claim f64_space;
+  defer heap.release from cb;
+  sb = heap.claim f64_space;
+  defer heap.release from sb;
+  cmds = heap.claim cmd_space;
+  defer heap.release from cmds;
+
+  random.seed var entropy, (clock.now as s64);
+  build_rings;
+  build_bases cb, sb;
+  reset cur;
+
+  screen.snapshot;
+  defer screen.restore;
+  tty.hide_cursor;
+  defer tty.show_cursor;
+
+  draw cur, cmds, cb, sb;
+
+  paused = false;
+  quit = false;
+  last = clock.now;
+  for not quit {
+    handle_input cur, cmds, cb, sb;
+    if or paused, (clock.elapsed_ms last < tick_ms) {
+      task.yield;
+      continue;
+    }
+    last = clock.now;
+    step cur, nxt;
+    draw cur, cmds, cb, sb;
+  }
+}

@@ -1,0 +1,376 @@
+--
+-- phono -- a .wax sound file player for the aldan 4
+-- usage:
+--      phono.play 'music/bach/bwv639.wax
+-- authors:
+--      ortfero <ortfero@gmail.com>, 2026
+-- license: cc-by-sa 4.0
+--
+-- streams a wax file (16-byte header, optional chunks, then the compressed body
+-- at the header's body offset) through core/sound, decoding one block at a time
+-- and pacing on the queue watermark (sound.ready) with a yield between fills.
+-- between waits it drains the key queue (ctrl+q stops, the arrows seek) and, once
+-- a second, rewrites an in-place "m:ss / m:ss" position line (from sound.played,
+-- i.e. actual playback) under the shell prompt. the sample count is read from the
+-- header up front, so the duration shows before playback.
+--
+-- the body is the wax rice bit stream (see tools/wax/wav2wax.zig): blocks of
+-- 2400 samples (100 ms), each byte-aligned and self-contained -- a 2-bit fixed
+-- predictor order, a 4-bit rice parameter k, `order` raw warm-up samples, then one
+-- rice-coded residual per remaining sample. a submit queues exactly the length it
+-- is handed, so the short final block needs no padding and one block is one fill.
+--
+-- seeking reads the file's "seek" chunk, a table of block byte offsets one every
+-- `interval` samples. because a block restarts the predictor from its own warm-up
+-- samples, any entry decodes cold. the chunk region is walked a header at a time
+-- and the table itself stays on disk, so neither scales with a buffer here.
+--
+
+import 'core/storage, 'core/bytes, 'core/file, 'core/sound,
+  'core/task, 'core/screen, 'core/tty, 'core/text, 'core/bit
+
+fn play (path string) raises storage.fault | bytes.fault
+
+...
+
+const rate        = 24000     -- samples per second: s8 mono @ 24 khz
+const header_size = 16        -- the wax header
+const block       = 2400      -- samples in a full wax block (100 ms)
+const seek_step   = 10        -- seconds an arrow key jumps
+
+-- the 16-byte wax header, a chunk header, a 16kb hostfs staging buffer, and one
+-- decoded block. the decoder state (bit cursor, current block, predictor history,
+-- position) is module-private and carried across calls; not reentrant.
+var hdrbuf   [16]u8
+var cbuf     [8]u8            -- one chunk header, or one seek entry
+var chunkbuf [16384]u8
+var winbuf   [2400]u8         -- one decoded block (= block)
+var strm_pos s64              -- read cursor into chunkbuf (bytes)
+var strm_len s64              -- valid bytes currently in chunkbuf
+var m_acc    b64              -- bit accumulator carried between blocks
+var m_nav    s64              -- valid bits in m_acc (the rest are zero)
+var left     s64              -- decoded samples still remaining in the file
+var samples  s64              -- total samples the header declares
+var body_off s64              -- byte offset where the body starts
+var chunk_at s64              -- file offset of the last found chunk's content
+var seek_off s64              -- file offset of the seek table's first entry
+var seek_count s64            -- entries in the seek table (0 = no table)
+var seek_interval s64         -- samples between seek entries
+var base     s64              -- samples that played before the current stream
+
+-- the bit reader holds the stream in a 64-bit accumulator: the top bit of
+-- `acc` is the next stream bit and only the top `navail` bits are valid (the
+-- rest are zero). the accumulator lives in next_block's locals through the hot
+-- loop and is carried between blocks in m_acc/m_nav; refills pull whole bytes
+-- from chunkbuf, so no per-bit call, division, or modulo is left per sample.
+
+-- top the accumulator up to at least 57 valid bits (or until eof),
+-- refilling chunkbuf from hostfs as it drains. bytes are never split across a
+-- refill, so a staging boundary only ever falls between whole bytes.
+fn refill (h file.id, var acc b64, var navail s64) raises storage.fault
+    var view []u8, b s64 {
+  for navail <= 56 {
+    if strm_pos >= strm_len {
+      view = file.read h, var chunkbuf;
+      strm_len = length view;
+      strm_pos = 0;
+      if strm_len == 0 { return none; }
+    }
+    b = chunkbuf[strm_pos] as s64;
+    strm_pos = strm_pos + 1;
+    acc = or acc, (bit.shil (b as b64), (56 - navail));
+    navail = navail + 8;
+  }
+}
+
+-- decode one whole block into winbuf and return its sample count, 0 once the
+-- file is spent. the last block is short; a submit takes it as it is. the
+-- predictor restarts from this block's own warm-up samples, so nothing carries
+-- across a block boundary and any block can be decoded cold after a seek. a
+-- block starts on a byte boundary, so the carried accumulator first drops its
+-- partial byte; the header is read as one 6-bit field (2-bit order, 4-bit k).
+-- per sample, the unary rice quotient falls out of one bit.clz and the low
+-- bits out of a shift pair.
+fn next_block s64 (h file.id) raises storage.fault
+    var acc b64, navail s64, o s64, k s64, n s64, got s64,
+    v s64, q s64, u s64, lo s64, w1 s64, w2 s64, w3 s64 {
+  if left <= 0 { return 0; }
+
+  -- byte-align the carried accumulator, then read the block header
+  acc = m_acc;
+  navail = m_nav;
+  q = navail mod 8;
+  acc = bit.shil acc, q;
+  navail = navail - q;
+  if navail < 57 { refill h, var acc, var navail; }
+  v = (bit.shir acc, 58) as s64;
+  acc = bit.shil acc, 6;
+  navail = navail - 6;
+  o = v / 16;
+  k = v mod 16;
+
+  n = block;
+  if n > left { n = left; }
+  got = 0;
+  for got < n {
+    if got < o {
+      -- warm-up sample, stored raw
+      if navail < 8 { refill h, var acc, var navail; }
+      v = (bit.shir acc, 56) as s64;
+      acc = bit.shil acc, 8;
+      navail = navail - 8;
+      if v > 127 { v = v - 256; }
+    } else {
+      -- unary quotient: leading zeros up to the stop bit
+      u = 0;
+      q = bit.clz acc;
+      for q >= navail {
+        u = u + navail;
+        acc = 0 as b64;
+        navail = 0;
+        refill h, var acc, var navail;
+        if navail == 0 { return 0; }          -- truncated file
+        q = bit.clz acc;
+      }
+      u = u + q;
+      acc = bit.shil acc, q;
+      acc = bit.shil acc, 1;
+      navail = navail - (q + 1);
+      -- low k bits complete the folded residual
+      if k > 0 {
+        if navail < k { refill h, var acc, var navail; }
+        lo = (bit.shir acc, (64 - k)) as s64;
+        acc = bit.shil acc, k;
+        navail = navail - k;
+        u = ((bit.shil (u as b64), k) as s64) + lo;
+      }
+      -- unfold the zigzag: even -> u/2, odd -> -(u/2) - 1
+      v = (bit.shir (u as b64), 1) as s64;
+      if (and (u as b64), (1 as b64)) == (1 as b64) { v = (0 - v) - 1; }
+      if o == 1 { v = v + w1; }
+      if o == 2 { v = v + ((2 * w1) - w2); }
+      if o == 3 { v = v + ((3 * (w1 - w2)) + w3); }
+    }
+    winbuf[got] = ((v + 256) mod 256) as u8;
+    w3 = w2;
+    w2 = w1;
+    w1 = v;
+    got = got + 1;
+  }
+  left = left - n;
+  m_acc = acc;
+  m_nav = navail;
+  return got;
+}
+
+-- walk the chunk region (each chunk: 4-byte magic, u16 le length, content) for
+-- the chunk with the given magic. only the 6-byte headers are read and each hop
+-- seeks straight over the content, so nothing here needs a buffer that scales
+-- with the region -- the seek table can be as long as the format allows. on a hit
+-- the file is left positioned at the content, chunk_at holds its offset, and the
+-- content length is returned; -1 when the file carries no such chunk.
+fn find_chunk s64 (h file.id, magic string) raises storage.fault
+    var view []u8, at s64, mlen s64 {
+  at = header_size;
+  for (at + 6) <= body_off {
+    file.seek h, at;
+    view = file.read h, var cbuf;
+    if (length view) < 6 { return -1; }
+    mlen = (cbuf[4] as s64) + (cbuf[5] as s64) * 256;
+    if and (cbuf[0] == magic[0]), (cbuf[1] == magic[1]),
+           (cbuf[2] == magic[2]), (cbuf[3] == magic[3]) {
+      chunk_at = at + 6;
+      file.seek h, chunk_at;
+      return mlen;
+    }
+    at = at + 6 + mlen;
+  }
+  return -1;
+}
+
+-- if the file carries a "meta" chunk, print its content. it is read a staging
+-- buffer at a time, so a meta longer than the buffer still prints in full.
+fn show_meta (h file.id) raises storage.fault
+    var view []u8, mlen s64, n s64 {
+  mlen = find_chunk h, "meta";
+  if mlen <= 0 { return none; }
+  for mlen > 0 {
+    view = file.read h, var chunkbuf;
+    n = length view;
+    if n <= 0 { return none; }
+    if n > mlen { n = mlen; }
+    tty.sayin view[0:n];
+    mlen = mlen - n;
+  }
+  tty.say "";
+}
+
+-- locate the "seek" chunk and note where its entries start, how many there are,
+-- and how many samples separate them. the entries themselves stay on disk -- one
+-- is four bytes, read on demand in seek_to -- so a long table costs the player
+-- nothing. seek_count stays 0 when the file carries no table, which disables
+-- seeking rather than failing the play.
+fn find_seek_chunk (h file.id) raises storage.fault
+    var view []u8, mlen s64 {
+  seek_off = 0;
+  seek_count = 0;
+  seek_interval = 0;
+  mlen = find_chunk h, "seek";
+  if mlen < 8 { return none; }
+  view = file.read h, var cbuf;
+  if (length view) < 8 { return none; }
+  seek_interval = (cbuf[0] as s64) + (cbuf[1] as s64) * 256
+                + (cbuf[2] as s64) * 65536 + (cbuf[3] as s64) * 16777216;
+  seek_count = (cbuf[4] as s64) + (cbuf[5] as s64) * 256
+             + (cbuf[6] as s64) * 65536 + (cbuf[7] as s64) * 16777216;
+  seek_off = chunk_at + 8;
+}
+
+-- jump to the seek entry covering `target` and restart the reader there. the
+-- entry is read straight off the file, so seeking needs no table in memory.
+fn seek_to (h file.id, target s64) raises storage.fault
+    var view []u8, i s64, off s64 {
+  if seek_interval <= 0 { return none; }
+  i = target;
+  if i < 0 { i = 0; }
+  i = i / seek_interval;
+  if i >= seek_count { i = seek_count - 1; }
+  if i < 0 { return none; }
+  file.seek h, (seek_off + i * 4);
+  view = file.read h, var cbuf;
+  if (length view) < 4 { return none; }
+  off = (cbuf[0] as s64) + (cbuf[1] as s64) * 256
+      + (cbuf[2] as s64) * 65536 + (cbuf[3] as s64) * 16777216;
+  file.seek h, (body_off + off);
+  strm_pos = 0;
+  strm_len = 0;
+  m_acc = 0 as b64;
+  m_nav = 0;
+  base = i * seek_interval;
+  left = samples - base;
+}
+
+-- drain the key queue and report what the operator asked for: 0 nothing, 1 stop
+-- (ctrl+q), 2 seek back, 3 seek forward (the left and right arrows).
+fn poll_control s64 () var k screen.key, act s64 {
+  act = 0;
+  for screen.poll_key var k {
+    if not k.is_key_down { continue; }
+    if and (k.code == 'q'), k.is_ctrl_pressed { return 1; }
+    if k.code == screen.key_arrow_left { act = 2; }
+    if k.code == screen.key_arrow_right { act = 3; }
+  }
+  return act;
+}
+
+-- rewrite the position line in place at `row`: "m:ss / m:ss   arrows: seek ...".
+-- each seconds digit is emitted on its own so it is always zero-padded. seeking
+-- can move the position backwards and shorten the minutes field, so the line ends
+-- in two spaces to paint over the character a shrinking line would leave behind.
+fn show_status (played_s s64, total_s s64, row s64) raises bytes.fault
+    var buffer [64]u8, line string {
+  line = text.format var buffer,
+    (played_s / 60), ":", ((played_s mod 60) / 10), ((played_s mod 60) mod 10),
+    " / ", (total_s / 60), ":", ((total_s mod 60) / 10), ((total_s mod 60) mod 10),
+    "   arrows: seek   ctrl+q: stop  ";
+  tty.at 0, row;
+  tty.sayin line;
+}
+
+-- open, validate, and stream a .wax file, showing position against duration.
+fn play (path string) raises storage.fault | bytes.fault
+    var h file.id, view []u8, got s64, total_s s64, played s64,
+    row s64, shown_s s64, act s64, pos s64 {
+
+  h = file.open path;
+  defer file.close h;
+
+  -- header: magic "wax1", u16 le rate, channels, format tag (byte 7: 1), u32 le
+  -- sample count, u32 le body offset. a file with the wrong magic, rate, channels,
+  -- or tag is rejected loudly rather than played as noise -- which is also how an
+  -- old .pcma file is turned away, on the magic.
+  view = file.read h, var hdrbuf;
+  if (length view) < header_size { raise bytes.fault.invalid_format; }
+  if or (hdrbuf[0] != 'w'), (hdrbuf[1] != 'a'), (hdrbuf[2] != 'x'), (hdrbuf[3] != '1'),
+        (((hdrbuf[4] as s64) + (hdrbuf[5] as s64) * 256) != 24000),
+        ((hdrbuf[6] as s64) != 1), ((hdrbuf[7] as s64) != 1) {
+    raise bytes.fault.invalid_format;
+  }
+
+  -- decoded sample count (u32 le): the duration and the exact end of the stream.
+  samples = (hdrbuf[8] as s64) + (hdrbuf[9] as s64) * 256
+          + (hdrbuf[10] as s64) * 65536 + (hdrbuf[11] as s64) * 16777216;
+  total_s = samples / rate;
+
+  -- body offset (u32 le): the bit stream starts here, past any chunks. print the
+  -- meta, pick up the seek table, then seek there so chunks are skipped rather
+  -- than decoded as audio.
+  body_off = (hdrbuf[12] as s64) + (hdrbuf[13] as s64) * 256
+           + (hdrbuf[14] as s64) * 65536 + (hdrbuf[15] as s64) * 16777216;
+  if body_off < header_size { raise bytes.fault.invalid_format; }
+
+  show_meta h;                 -- print the meta chunk if the file carries one
+  find_seek_chunk h;           -- note the seek table if the file carries one
+  file.seek h, body_off;       -- position at the body for streaming
+
+  row = tty.row;
+  tty.hide_cursor;
+  defer tty.show_cursor;
+
+  strm_pos = 0;
+  strm_len = 0;
+  m_acc = 0 as b64;
+  m_nav = 0;
+  left = samples;
+  base = 0;
+  shown_s = -1;
+  show_status 0, total_s, row;
+
+  -- body: one block per fill, paced on the queue watermark with a yield (and a
+  -- control poll) between them. the position line follows base + sound.played --
+  -- actual playback, not submission -- so it stays honest across a seek.
+  got = next_block h;
+  if got > 0 {
+    sound.begin winbuf[0:got];           -- the first block starts the stream
+    got = next_block h;
+    for got > 0 {
+      act = poll_control;
+      for and (not sound.ready), (act == 0) {
+        task.yield;
+        act = poll_control;
+      }
+      if act == 1 { sound.stop; tty.say ""; return none; }
+      if act > 1 {
+        if seek_count > 0 {
+          pos = base + sound.played;
+          if act == 2 { pos = pos - (seek_step * rate); }
+          if act == 3 { pos = pos + (seek_step * rate); }
+          if pos < 0 { pos = 0; }
+          if pos >= samples { pos = samples - 1; }
+          sound.stop;
+          seek_to h, pos;
+          got = next_block h;
+          if got > 0 {
+            sound.begin winbuf[0:got];
+            got = next_block h;
+          }
+          shown_s = base / rate;
+          show_status shown_s, total_s, row;
+        }
+        continue;
+      }
+      sound.fill winbuf[0:got];
+      played = base + sound.played;
+      if (played / rate) != shown_s {
+        shown_s = played / rate;
+        show_status shown_s, total_s, row;
+      }
+      got = next_block h;
+    }
+    sound.finish;
+  }
+
+  -- settle the final position, then drop to a fresh line for the shell prompt.
+  show_status total_s, total_s, row;
+  tty.say "";
+}

@@ -7,18 +7,20 @@
 -- license: cc-by-sa 4.0
 --
 
-import 'core/clock, 'core/random, 'core/screen,
+import 'core/bytes, 'core/logic, 'core/resource, 'core/clock, 'core/random, 'core/screen,
   'core/task, 'core/heap, 'core/text
 
 fn play()
-    raises logic_fault, data_fault, resource_fault
+    raises logic.fault | bytes.fault | resource.fault
 
-body
+...
 
 const board_x   = 37
 const board_y   = 10
 const board_w   = 60
+const board_w_2 = 30
 const board_h   = 24
+const board_h_2 = 12
 const max_len   = 1024
 const ring_mask = 1023  -- masks the ring index
 const tick_ms   = 100
@@ -35,77 +37,72 @@ type state record {
   quit bool
 }
 
-fn handle_input (st& state) ...
-fn try_turn (st& state, nx s64, ny s64) ...
-fn reset (st& state, sx& coords, sy& coords)
-  raises logic_fault ...
-fn place_food (st& state, sx coords, sy coords)
-  raises logic_fault ...
-fn step (st& state, sx& coords, sy& coords)
-  raises logic_fault ...
-fn draw (fr& frame, st state, sx coords, sy coords)
-  raises data_fault, logic_fault ...
+fn handle_input (var st state) ...
+fn try_turn (var st state, nx s64, ny s64) ...
+fn reset (var st state, var sx coords, var sy coords)
+  raises logic.fault ...
+fn place_food (var st state, sx coords, sy coords)
+  raises logic.fault ...
+fn step (var st state, var sx coords, var sy coords)
+  raises logic.fault ...
+fn draw (var fr frame, st state, sx coords, sy coords)
+  raises bytes.fault | logic.fault ...
 
 -- entry point: snapshot the screen, seed, draw, run until quit
 fn play ()
-  raises logic_fault, data_fault, resource_fault
+  raises logic.fault | bytes.fault | resource.fault
   var st ^state, snake_x ^coords, snake_y ^coords
-  var fr ^frame, last s64 {
+  var fr ^frame, last clock.tick {
 
   st = heap.claim state;
-  defer heap.release st;
+  defer heap.release from st;
   snake_x = heap.claim coords;
-  defer heap.release snake_x;
+  defer heap.release from snake_x;
   snake_y = heap.claim coords;
-  defer heap.release snake_y;
+  defer heap.release from snake_y;
   fr = heap.claim frame;
-  defer heap.release fr;
+  defer heap.release from fr;
 
   screen.snapshot;
   defer screen.restore;
 
-  random.seed st^.entropy&, clock.now;
-  reset st^&, snake_x^&, snake_y^&;
-  draw fr^&, st^, snake_x^, snake_y^;
+  random.seed var st^.entropy, (clock.now as s64);
+  reset var st^, var snake_x^, var snake_y^;
+  draw var fr^, st^, snake_x^, snake_y^;
 
   st^.quit = false;
   last = clock.now;
 
   for not st^.quit {
-    handle_input st^&;
+    handle_input var st^;
     if (clock.elapsed_ms last) < tick_ms {
       task.yield;
       continue;
     }
     last = clock.now;
-    step st^&, snake_x^&, snake_y^&;
-    draw fr^&, st^, snake_x^, snake_y^;
+    step var st^, var snake_x^, var snake_y^;
+    draw var fr^, st^, snake_x^, snake_y^;
   }
 }
 
 
 -- drain pending key events; turn the snake or quit
-fn handle_input (st& state)
+fn handle_input (var st state)
   var k screen.key {
-  for screen.poll_key k& {
+  for screen.poll_key var k {
     if not (k.is_key_down) { continue; }
-    if k.is_control_key {
-      when k.code {
-      | screen.key_arrow_up: try_turn st&, 0, -1;
-      | screen.key_arrow_down: try_turn st&, 0, 1;
-      | screen.key_arrow_left: try_turn st&, -1, 0;
-      | screen.key_arrow_right: try_turn st&, 1, 0;
-      }
-      return none;
-    }
-    if and (k.code == 'q'), k.is_ctrl_pressed {
-      return st.quit = true;
+    when k.code {
+    | screen.key_arrow_up: try_turn var st, 0, -1; return none;
+    | screen.key_arrow_down: try_turn var st, 0, 1; return none;
+    | screen.key_arrow_left: try_turn var st, -1, 0; return none;
+    | screen.key_arrow_right: try_turn var st, 1, 0; return none;
+    | 'q': if k.is_ctrl_pressed { return st.quit = true; }
     }
   }
 }
 
 -- change direction, rejecting a 180-degree reversal onto the neck
-fn try_turn (st& state, nx s64, ny s64)
+fn try_turn (var st state, nx s64, ny s64)
   var opposite bool {
   opposite = and (nx == -st.dir_x), (ny == -st.dir_y);
   if opposite { return none; }
@@ -114,26 +111,27 @@ fn try_turn (st& state, nx s64, ny s64)
 
 
 -- (re)initialise the snake at the centre and drop the first food
-fn reset (st& state, sx& coords, sy& coords)
-  raises logic_fault {
+fn reset (var st state, var sx coords, var sy coords)
+  raises logic.fault {
+
   st.head = 0; st.tail = 0;
-  sx[0] = board_x + board_w / 2;
-  sy[0] = board_y + board_h / 2;
+  sx[0] = board_x + board_w_2;
+  sy[0] = board_y + board_h_2;
   st.dir_x = 1; st.dir_y = 0;
   st.score = 0;
-  place_food st&, sx, sy;
+  place_food var st, sx, sy;
 }
 
 
 -- pick a random empty cell for the next food
-fn place_food (st& state, sx coords, sy coords)
-  raises logic_fault
+fn place_food (var st state, sx coords, sy coords)
+  raises logic.fault
   var i s64, e s64, collision bool {
 
   e = and (st.head + 1), ring_mask;
   collision = true; for collision {
-    st.food_x = random.range st.entropy&, board_x, (board_x + board_w);
-    st.food_y = random.range st.entropy&, board_y, (board_y + board_h);
+    st.food_x = random.range var st.entropy, board_x, (board_x + board_w);
+    st.food_y = random.range var st.entropy, board_y, (board_y + board_h);
     collision = false;
     i = st.tail; for and (i != e), (not collision);
     i = and (i + 1), ring_mask {
@@ -144,44 +142,50 @@ fn place_food (st& state, sx coords, sy coords)
 
 
 -- advance one tick: move the head, handle walls, growth, and eating
-fn step (st& state, sx& coords, sy& coords)
-  raises logic_fault
-  var nx s64, ny s64, new_head s64 {
+fn step (var st state, var sx coords, var sy coords)
+  raises logic.fault
+  var nx s64, ny s64, new_head s64
+  var outside bool, ate_food bool {
 
   nx = sx[st.head] + st.dir_x;
   ny = sy[st.head] + st.dir_y;
-  if or (nx < board_x), (nx >= board_x + board_w),
-        (ny < board_y), (ny >= board_y + board_h) {
-    return st.quit = true;
-  }
+  outside = or
+    (nx < board_x), (nx >= board_x + board_w),
+    (ny < board_y), (ny >= board_y + board_h);
+  if outside { return st.quit = true; }
   new_head = and (st.head + 1), ring_mask;
   sx[new_head] = nx;
   sy[new_head] = ny;
   st.head = new_head;
-  if and (nx == st.food_x), (ny == st.food_y) {
+  ate_food = and (nx == st.food_x), (ny == st.food_y);
+  if ate_food {
     st.score += 1;
-    place_food st&, sx, sy;
+    place_food var st, sx, sy;
   } else {
     st.tail = and (st.tail + 1), ring_mask;
   }
 }
 
 -- redraw the whole: clear, border, title, snake, food, score
-fn draw (fr& frame, st state, sx coords, sy coords)
-  raises data_fault, logic_fault
+fn draw (var fr frame, st state, sx coords, sy coords)
+  raises bytes.fault | logic.fault
   var i s64, off s64, e s64, buffer [64]u8 {
 
-  screen.clear fr&;
-  screen.bottom fr&, " ctrl+q: quit";
-  screen.frame fr&, (board_x - 1), (board_y - 1),
+  screen.clear var fr;
+  screen.bottom var fr, " ctrl+q: quit";
+
+  screen.frame var fr, (board_x - 1), (board_y - 1),
     (board_w + 2), (board_h + 2);
-  e = and (st.head + 1), ring_mask;
+
+  e = and (st.head), ring_mask;
   i = st.tail; for i != e; i = and (i + 1), ring_mask {
-    off = sy[i] * screen.width + sx[i];
-    fr[off] = if i == st.head { '@'; } else { 'o'; };
+    fr[sy[i] * screen.width + sx[i]] = 'o';
   }
+  fr[sy[st.head] * screen.width + sx[st.head]] = '@';
+  
   fr[st.food_y * screen.width + st.food_x] = '*';
-  screen.print fr&, (board_x - 1), (board_y - 2),
-    (text.format buffer&, "score: ", st.score);
+
+  screen.print var fr, (board_x - 1), (board_y - 2),
+    (text.format var buffer, "score: ", st.score);
   screen.blit fr, screen.normal;
 }

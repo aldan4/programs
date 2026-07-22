@@ -7,29 +7,28 @@
 -- license: cc-by-sa 4.0
 --
 
-import 'core/clock, 'core/random, 'core/boolean,
-  'core/screen, 'core/task, 'core/heap, 'core/text
+import 'core/bytes, 'core/logic, 'core/resource,
+  'core/clock, 'core/random, 'core/boolean, 'core/screen,
+  'core/task, 'core/heap, 'core/text
 
-fn play() raises logic_fault, data_fault, resource_fault
+fn play()
+  raises logic.fault | bytes.fault | resource.fault
 
-body
+...
 
-const board_x       = 3
+const board_x       = 28
 const board_y       = 3
-const board_h       = 40
-const board_w       = 128 -- should be power of 2
-const grid_size     = 5120 -- board_w * board_h
+const board_h       = 34
+const board_w       = 64 -- should be power of 2
+const grid_size     = 2176 -- board_w * board_h
 const tick_ms       = 100
 const live_density  = 30 -- for reset
 
 
 -- state
 
--- the two grids and the frame live on the heap only while the demo runs; they
--- are claimed as non-null locals in `play` and threaded as parameters, so the
--- workers need no guard.
-type cell_buffer  [grid_size]bool
-type frame_buffer [screen.size]u8
+type cells_space  [grid_size]bool
+type frame_space [screen.size]u8
 
 var entropy      random.state
 var paused       bool
@@ -38,53 +37,55 @@ var population   s64
 
 
 -- count live neighbours of cell `i` (its column is `x`)
-fn count_neighbors s64 (x s64, i s64, cs ^cell_buffer)
-    n s64, left bool, right bool, up bool, down bool {
+fn count_neighbors s64 (x s64, i s64, cells cells_space)
+  var n s64, left bool, right bool, up bool, down bool {
+
   n = 0;
   left = x != 0; right = x != board_w - 1;
   up = i >= board_w; down = i < grid_size - board_w;
-  if and up, left, cs^[i - board_w - 1] { n += 1; }
-  if and up, cs^[i - board_w] { n += 1; }
-  if and up, right, cs^[i - board_w + 1] { n += 1; }
-  if and left, cs^[i - 1] { n += 1; }
-  if and right, cs^[i + 1] { n += 1; }
-  if and down, left, cs^[i + board_w - 1] { n += 1; }
-  if and down, cs^[i + board_w] { n += 1; }
-  if and down, right, cs^[i + board_w + 1] { n += 1; }
+  if and up, left, cells[i - board_w - 1] { n += 1; }
+  if and up, cells[i - board_w] { n += 1; }
+  if and up, right, cells[i - board_w + 1] { n += 1; }
+  if and left, cells[i - 1] { n += 1; }
+  if and right, cells[i + 1] { n += 1; }
+  if and down, left, cells[i + board_w - 1] { n += 1; }
+  if and down, cells[i + board_w] { n += 1; }
+  if and down, right, cells[i + board_w + 1] { n += 1; }
   n;
 }
 
 
 -- advance one generation: update cells, population, generation
-fn step (cs ^cell_buffer, nx ^cell_buffer)
-    n s64, born bool, i s64, p s64, x s64 {
+fn step (var cells cells_space, var next cells_space)
+  var n s64, born bool, i s64, p s64, x s64 {
+
   p = 0; x = 0;
   i = 0; for i != grid_size; i += 1 {
-    n = count_neighbors x, i, cs;
-    born = if cs^[i] {
+    n = count_neighbors x, i, cells;
+    born = if cells[i] {
       or (n == 2), (n == 3);
     } else {
       n == 3;
     };
-    nx^[i] = born;
+    next[i] = born;
     if born { p += 1; }
     x = and (x + 1), (board_w - 1);
   }
-  boolean.copy nx^, cs^&;
+  boolean.copy next, var cells;
   population = p; generation += 1;
 }
 
--- reseed cells with live_density% alive; zero generation, recount population
-fn reset (cs ^cell_buffer)
-    raises logic_fault
-    i s64, p s64 {
-  p = 0;
-  i = 0; for i != grid_size; i += 1 {
-    if (random.range entropy&, 0, 100) < live_density {
+-- reseed cells with live_density% alive
+fn reset (var cells cells_space)
+  raises logic.fault
+  var i s64, p s64 {
+
+  for i != grid_size; i += 1 {
+    if (random.range var entropy, 0, 100) < live_density {
       p += 1;
-      cs^[i] = true;
+      cells[i] = true;
     } else {
-      cs^[i] = false;
+      cells[i] = false;
     }
   }
   
@@ -95,28 +96,30 @@ fn reset (cs ^cell_buffer)
 -- draw
 
 -- redraw the frame: border, live cells, then blit
-fn draw (fr ^frame_buffer, cs ^cell_buffer)
-    raises data_fault, logic_fault
-    x s64, y s64, i s64, j s64, buffer [128]u8 {
-  screen.clear fr^&;
-  screen.bottom fr^&,
+fn draw (var frame frame_space, cells cells_space)
+  raises bytes.fault | logic.fault
+  var x s64, y s64, i s64, j s64, caption [128]u8 {
+
+  screen.clear var frame;
+  screen.bottom var frame,
     " space: pause, r: reset, ctrl+q: quit";
-  screen.frame fr^&, (board_x - 1), (board_y - 1),
+  screen.frame var frame, (board_x - 1), (board_y - 1),
     (board_w + 2), (board_h + 2);
 
   y = 0; for y != board_h; y += 1 {
     x = 0; for x != board_w; x += 1 {
       j = y * board_w + x;
-      if not cs^[j] { continue; }
+      if not cells[j] { continue; }
       i = (board_y + y) * screen.width + (board_x + x);
-      fr^[i] = '#';
+      frame[i] = '#';
     }
   }
 
-  screen.print fr^&, (board_x - 1), (board_y - 2),
-    (text.format buffer&, "gen: ", generation, "  pop: ", population, "  ",
+  screen.print var frame, (board_x - 1), (board_y - 2),
+    (text.format var caption, "gen: ", generation,
+      "  pop: ", population, "  ",
       (if paused { "[paused]"; } else { ""; }));
-  screen.blit fr^, screen.normal;
+  screen.blit frame, screen.normal;
 }
 
 
@@ -125,21 +128,20 @@ fn draw (fr ^frame_buffer, cs ^cell_buffer)
 var quit bool
 
 -- drain pending key events; toggle pause, trigger reset, or quit
-fn handle_input (fr ^frame_buffer, cs ^cell_buffer)
-    raises data_fault, logic_fault
-    k screen.key {
+fn handle_input (var frame frame_space, var cells cells_space)
+  raises bytes.fault | logic.fault
+  var k screen.key {
 
-  for screen.poll_key k& {
+  for screen.poll_key var k {
     if not (k.is_key_down) { continue; }
-    if k.is_control_key { return none; }
     when k.code {
     | 'q':
       if not k.is_ctrl_pressed { continue; }
       quit = true; return none;
     | ' ':
-      paused = not paused; draw fr, cs;
+      paused = not paused; draw var frame, cells;
     | 'r':
-      reset cs; draw fr, cs;
+      reset var cells; draw var frame, cells;
     }
   }
 }
@@ -147,31 +149,34 @@ fn handle_input (fr ^frame_buffer, cs ^cell_buffer)
 
 -- entry point: snapshot the screen, seed, paint, run until quit
 fn play ()
-    raises logic_fault, data_fault, resource_fault
-    last clock.tick, cells ^cell_buffer, next_cells ^cell_buffer, frame ^frame_buffer {
+  raises logic.fault | bytes.fault | resource.fault
+  var last clock.tick, cells ^cells_space
+  var next_cells ^cells_space, frame ^frame_space {
 
-  cells = heap.claim cell_buffer;
-  defer heap.release cells;
-  next_cells = heap.claim cell_buffer;
-  defer heap.release next_cells;
-  frame = heap.claim frame_buffer;
-  defer heap.release frame;
+  cells = heap.claim cells_space;
+  defer heap.release from cells;
+  next_cells = heap.claim cells_space;
+  defer heap.release from next_cells;
+  frame = heap.claim frame_space;
+  defer heap.release from frame;
   screen.snapshot;
   defer screen.restore;
 
-  random.seed entropy&, clock.now;
-  reset cells; draw frame, cells;
+  random.seed var entropy, (clock.now as s64);
+  reset var cells^;
+  draw var frame^, cells^;
 
   paused = false;
   last = clock.now;
 
   quit = false; for not quit {
-    handle_input frame, cells;
+    handle_input var frame^, var cells^;
     if or paused, (clock.elapsed_ms last < tick_ms) {
       task.yield;
       continue;
     }
     last = clock.now;
-    step cells, next_cells; draw frame, cells;
+    step var cells^, var next_cells^;
+    draw var frame^, cells^;
   }
 }

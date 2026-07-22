@@ -1,0 +1,161 @@
+--
+-- sieve -- prime number stream and cpu benchmark
+-- usage:
+--      sieve.bench
+--      sieve.print 100
+-- authors:
+--      ortfero <ortfero@gmail.com>, 2026
+-- license: cc-by-sa 4.0
+--
+
+import 'core/logic, 'core/resource, 'core/clock,
+  'core/task, 'core/tty, 'core/collections/bitset,
+  'aldos/machine
+
+type stream record {
+  bits bitset.ty, count s64, current s64
+}
+
+fn create (into s stream, upto s64)
+  raises resource.fault
+fn dispose (from s stream)
+fn reset (var s stream)
+fn next bool (var s stream, var p s64)
+fn print (upto s64)
+  raises resource.fault
+fn bench s64 ()
+  raises logic.fault | resource.fault
+
+...
+
+
+-- set `s` up to stream the primes not exceeding `upto`
+fn create (into s stream, upto s64)
+  raises resource.fault {
+
+  -- one flag per odd number 3 <= 2*i + 3 <= upto
+  s.count = 0;
+  if upto > 2 { s.count = (upto - 1) / 2; }
+
+  bitset.create into s.bits, s.count;
+
+  -- the flags track only odds: -1 keeps 2 pending
+  s.current = -1;
+  if upto < 2 { s.current = 0; }
+}
+
+
+-- dispose the stream. `from` consumes it: bitset.dispose likewise consumes
+-- s.bits, and the caller's stream dies at the call.
+fn dispose (from s stream) {
+  bitset.dispose from s.bits;
+}
+
+
+-- re-arm a drained stream for another full pass:
+-- clear every flag and rewind to the pending 2
+fn reset (var s stream) {
+  bitset.reset var s.bits;
+  s.current = -1;
+}
+
+
+-- write the next prime into `p` and return true,
+-- or false when the stream is drained
+fn next bool (var s stream, var prime s64)
+  var c s64, n s64, k s64 {
+
+  if s.current < 0 {
+    s.current = 0;
+    prime = 2;
+    return true;
+  }
+
+  c = s.current;
+  n = s.count;
+  for c != n; c += 1 {
+    if bitset.test s.bits, c { continue; }
+
+    -- flag c is the prime 2*c + 3; cross out its odd
+    -- multiples so later scans skip them. the stride is
+    -- `prime` because each step advances 2*prime in value
+    -- space, skipping the evens we never tracked.
+    prime = c + c + 3;
+    k = c + prime; for k < n; k += prime {
+      bitset.set var s.bits, k;
+    }
+
+    s.current = c + 1;
+    return true;
+  }
+  s.current = c;
+  false;
+}
+
+
+-- print the primes not exceeding `upto`
+fn print (upto s64)
+  raises resource.fault
+  var s stream, prime s64, more bool {
+
+  create into s, upto;
+  defer dispose from s;
+
+  more = next var s, var prime;
+  for more; more = next var s, var prime {
+    tty.sayin prime, " ";
+  }
+  tty.say "";
+}
+
+
+const bench_upto   = 16381  -- 8190 odd flags
+const primes_count = 1900
+const nof_samples  = 20
+const window_ms    = 50
+
+-- benchmark the sieve and return the maximum
+-- executed millions of instructions per second
+fn bench s64 ()
+  raises logic.fault | resource.fault
+  var s stream, si s64
+  var executed s64, ips s64, best_ips s64
+  var started clock.tick, actual_ms s64
+  var prime s64, count s64, more bool {
+
+  create into s, bench_upto;
+  defer dispose from s;
+
+  -- check algorithm is correct
+  more = next var s, var prime;
+  for more; more = next var s, var prime {
+    count += 1;
+  }
+  if count != primes_count {
+    raise logic.fault.contract_failed;
+  }
+
+  -- calculate several times to get best ips
+  for si != nof_samples; si += 1 {
+    started = clock.now;
+    executed = machine.instret;
+
+    -- drain the stream over and over for a full window
+    actual_ms = clock.elapsed_ms started;
+    for actual_ms <= window_ms;
+        actual_ms = clock.elapsed_ms started {
+      reset var s;
+      more = next var s, var prime;
+      for more; more = next var s, var prime { }
+    }
+    executed = machine.instret - executed;
+
+    -- recalculate to instructions per second
+    ips = (executed * 1000) / actual_ms;
+    if ips > best_ips { best_ips = ips; }
+    task.yield;
+  }
+
+  -- report whole mips
+  best_ips / 1000000;
+}
